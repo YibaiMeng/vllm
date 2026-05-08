@@ -90,6 +90,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
     import vllm.utils.flashinfer as fi_utils
 
+    logger.info("Starting FlashInfer autotuning.")
     with torch.inference_mode(), fi_utils.autotune():
         # Certain FlashInfer kernels (e.g. nvfp4 routed moe) are
         # incompatible with autotuning. This state is used to skip
@@ -107,3 +108,4 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         )
 
         fi_utils._is_fi_autotuning = False
+    logger.info("FlashInfer autotuning complete.")

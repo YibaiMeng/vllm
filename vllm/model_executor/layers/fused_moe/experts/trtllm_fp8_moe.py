@@ -56,6 +56,12 @@ class TrtLlmFp8ExpertsBase:
         self.moe_config = moe_config
         self.quant_config = quant_config
 
+        from vllm.config import get_current_vllm_config
+
+        self.max_capture_size = (
+            get_current_vllm_config().compilation_config.max_cudagraph_capture_size
+        )
+
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
@@ -189,29 +195,33 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             weight_layout = WeightLayout.BlockMajorK
             hidden_states_scale = a1q_scale.t().contiguous()
 
-        flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(
-            topk_ids=packed_topk_ids,
-            routing_bias=None,
-            hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale,
-            gemm1_weights=w1,
-            gemm1_weights_scale=self.quant_config.w1_scale,
-            gemm2_weights=w2,
-            gemm2_weights_scale=self.quant_config.w2_scale,
-            num_experts=global_num_experts,
-            top_k=self.topk,
-            n_group=None,
-            topk_group=None,
-            intermediate_size=self.intermediate_size_per_partition,
-            local_expert_offset=self.ep_rank * self.local_num_experts,
-            local_num_experts=self.local_num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=1,  # not used
-            use_shuffled_weight=use_shuffled_weight,
-            weight_layout=weight_layout,
-            fp8_quantization_type=fp8_quant_type,
-            output=output,
-        )
+        from vllm.utils.flashinfer import _is_fi_autotuning, autotune
+
+        with autotune(_is_fi_autotuning):
+            flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(
+                topk_ids=packed_topk_ids,
+                routing_bias=None,
+                hidden_states=hidden_states,
+                hidden_states_scale=hidden_states_scale,
+                gemm1_weights=w1,
+                gemm1_weights_scale=self.quant_config.w1_scale,
+                gemm2_weights=w2,
+                gemm2_weights_scale=self.quant_config.w2_scale,
+                num_experts=global_num_experts,
+                top_k=self.topk,
+                n_group=None,
+                topk_group=None,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=1,  # not used
+                use_shuffled_weight=use_shuffled_weight,
+                weight_layout=weight_layout,
+                fp8_quantization_type=fp8_quant_type,
+                tune_max_num_tokens=max(self.max_capture_size, 1),
+                output=output,
+            )
 
 
 class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):
@@ -345,28 +355,32 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             weight_layout = WeightLayout.BlockMajorK
             hidden_states_scale = a1q_scale.t().contiguous()
 
-        return flashinfer.fused_moe.trtllm_fp8_block_scale_moe(
-            routing_logits=router_logits,
-            routing_bias=e_score_correction_bias,
-            hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale,
-            gemm1_weights=w1,
-            gemm1_weights_scale=self.quant_config.w1_scale,
-            gemm2_weights=w2,
-            gemm2_weights_scale=self.quant_config.w2_scale,
-            num_experts=global_num_experts,
-            top_k=self.topk,
-            n_group=(num_expert_group or 0),
-            topk_group=(topk_group or 0),
-            intermediate_size=self.intermediate_size_per_partition,
-            local_expert_offset=self.ep_rank * self.local_num_experts,
-            local_num_experts=self.local_num_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            routing_method_type=self.routing_method_type,
-            use_shuffled_weight=use_shuffled_weight,
-            weight_layout=weight_layout,
-            fp8_quantization_type=fp8_quant_type,
-        )
+        from vllm.utils.flashinfer import _is_fi_autotuning, autotune
+
+        with autotune(_is_fi_autotuning):
+            return flashinfer.fused_moe.trtllm_fp8_block_scale_moe(
+                routing_logits=router_logits,
+                routing_bias=e_score_correction_bias,
+                hidden_states=hidden_states,
+                hidden_states_scale=hidden_states_scale,
+                gemm1_weights=w1,
+                gemm1_weights_scale=self.quant_config.w1_scale,
+                gemm2_weights=w2,
+                gemm2_weights_scale=self.quant_config.w2_scale,
+                num_experts=global_num_experts,
+                top_k=self.topk,
+                n_group=(num_expert_group or 0),
+                topk_group=(topk_group or 0),
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                routing_method_type=self.routing_method_type,
+                use_shuffled_weight=use_shuffled_weight,
+                weight_layout=weight_layout,
+                fp8_quantization_type=fp8_quant_type,
+                tune_max_num_tokens=max(self.max_capture_size, 1),
+            )
 
     def _apply_per_tensor(
         self,
@@ -404,27 +418,31 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         if e_score_correction_bias is not None:
             e_score_correction_bias = e_score_correction_bias.to(torch.bfloat16)
 
-        out = flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_moe(
-            routing_logits=router_logits,
-            routing_bias=e_score_correction_bias,
-            hidden_states=hidden_states,
-            gemm1_weights=w1,
-            output1_scales_scalar=self._g1_scale_c,
-            output1_scales_gate_scalar=self._g1_alphas,
-            gemm2_weights=w2,
-            output2_scales_scalar=self._g2_alphas,
-            num_experts=global_num_experts,
-            top_k=self.topk,
-            n_group=num_expert_group or 0,
-            topk_group=topk_group or 0,
-            intermediate_size=self.intermediate_size_per_partition,
-            local_expert_offset=self.ep_rank * self.local_num_experts,
-            local_num_experts=self.local_num_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            use_routing_scales_on_input=apply_router_weight_on_input,
-            routing_method_type=self.routing_method_type,
-            activation_type=activation_type,
-        )
+        from vllm.utils.flashinfer import _is_fi_autotuning, autotune
+
+        with autotune(_is_fi_autotuning):
+            out = flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_moe(
+                routing_logits=router_logits,
+                routing_bias=e_score_correction_bias,
+                hidden_states=hidden_states,
+                gemm1_weights=w1,
+                output1_scales_scalar=self._g1_scale_c,
+                output1_scales_gate_scalar=self._g1_alphas,
+                gemm2_weights=w2,
+                output2_scales_scalar=self._g2_alphas,
+                num_experts=global_num_experts,
+                top_k=self.topk,
+                n_group=num_expert_group or 0,
+                topk_group=topk_group or 0,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                use_routing_scales_on_input=apply_router_weight_on_input,
+                routing_method_type=self.routing_method_type,
+                activation_type=activation_type,
+                tune_max_num_tokens=max(self.max_capture_size, 1),
+            )
         return out
 
     def apply(

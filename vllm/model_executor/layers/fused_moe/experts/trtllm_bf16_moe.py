@@ -38,6 +38,12 @@ class TrtLlmBf16Experts(mk.FusedMoEExpertsMonolithic):
         self.local_num_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
 
+        from vllm.config import get_current_vllm_config
+
+        self.max_capture_size = (
+            get_current_vllm_config().compilation_config.max_cudagraph_capture_size
+        )
+
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
@@ -127,18 +133,22 @@ class TrtLlmBf16Experts(mk.FusedMoEExpertsMonolithic):
     ) -> torch.Tensor:
         import flashinfer
 
-        return flashinfer.fused_moe.trtllm_bf16_moe(
-            routing_logits=router_logits,
-            routing_bias=e_score_correction_bias,
-            hidden_states=hidden_states,
-            gemm1_weights=w1,
-            gemm2_weights=w2,
-            num_experts=global_num_experts,
-            top_k=self.topk,
-            n_group=num_expert_group,
-            topk_group=topk_group,
-            intermediate_size=self.intermediate_size_per_partition,
-            local_expert_offset=self.ep_rank * self.local_num_experts,
-            local_num_experts=self.local_num_experts,
-            routing_method_type=self.routing_method_type,
-        )
+        from vllm.utils.flashinfer import _is_fi_autotuning, autotune
+
+        with autotune(_is_fi_autotuning):
+            return flashinfer.fused_moe.trtllm_bf16_moe(
+                routing_logits=router_logits,
+                routing_bias=e_score_correction_bias,
+                hidden_states=hidden_states,
+                gemm1_weights=w1,
+                gemm2_weights=w2,
+                num_experts=global_num_experts,
+                top_k=self.topk,
+                n_group=num_expert_group,
+                topk_group=topk_group,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routing_method_type=self.routing_method_type,
+                tune_max_num_tokens=max(self.max_capture_size, 1),
+            )
