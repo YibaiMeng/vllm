@@ -15,6 +15,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
     linear_batch_invariant,
@@ -28,6 +29,8 @@ from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -272,6 +275,17 @@ class VocabParallelEmbedding(PluggableLayer):
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
+
+        # pr43343 probe: log lm_head dispatch so bench_serve_pr43343.sh can A/B
+        # whether #43343's quant-routing actually fires. Gated on prefix so we
+        # don't spam for input embeddings.
+        if "lm_head" in prefix:
+            logger.info(
+                "lm_head[%s] dispatch -> %s (quant_config=%s)",
+                prefix,
+                type(quant_method).__name__,
+                type(quant_config).__name__ if quant_config is not None else None,
+            )
 
         # If we are making an embedding layer, then our quantization linear
         # method must implement the embedding operation. If we are another
