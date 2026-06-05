@@ -271,6 +271,15 @@ Those map directly to the Prometheus metrics:
 - `vllm:kv_block_idle_before_evict_seconds` – idle tail after the final access.
 - `vllm:kv_block_reuse_gap_seconds` – time between consecutive touches.
 
+The same flag also enables two unsampled prefix-cache metrics:
+
+- `vllm:prefix_cache_blocks` (Gauge) – blocks currently holding cached prefix
+  content. Unlike `vllm:kv_cache_usage_perc`, which reports live-request
+  occupancy (freed-but-cached blocks count as free), this reflects how much
+  reusable content the prefix cache holds.
+- `vllm:prefix_cache_evicted_blocks` (Counter) – cumulative blocks evicted from
+  the prefix cache to make room for new allocations.
+
 The engine core only ships raw eviction events via `SchedulerStats`; the
 frontend drains them, turns them into Prometheus observations, and also
 exposes the same data through `LLM.get_metrics()` when logging is on.

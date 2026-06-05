@@ -181,6 +181,15 @@ class KVCacheManager:
         """
         return self.block_pool.get_usage()
 
+    def get_num_cached_blocks(self) -> int:
+        """Get the number of blocks currently holding cached prefix content."""
+        return self.block_pool.get_num_cached_blocks()
+
+    def take_num_evicted_blocks(self) -> int:
+        """Get (and reset) the number of prefix-cache blocks evicted since the
+        last call."""
+        return self.block_pool.take_num_evicted_blocks()
+
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
 

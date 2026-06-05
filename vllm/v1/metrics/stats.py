@@ -187,6 +187,11 @@ class SchedulerStats:
 
     kv_cache_eviction_events: list[KVCacheEvictionEvent] = field(default_factory=list)
 
+    # Number of blocks currently holding cached prefix content (snapshot).
+    prefix_cache_blocks: int = 0
+    # Number of prefix-cache blocks evicted since the last stats update.
+    prefix_cache_evicted_blocks: int = 0
+
     spec_decoding_stats: SpecDecodingStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
 

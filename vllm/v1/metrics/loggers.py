@@ -998,10 +998,40 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.histogram_kv_block_reuse_gap = create_metric_per_engine(
                 histogram_kv_block_reuse_gap, per_engine_labelvalues
             )
+
+            gauge_prefix_cache_blocks = self._gauge_cls(
+                name="vllm:prefix_cache_blocks",
+                documentation=(
+                    "Number of KV cache blocks currently holding cached prefix "
+                    "content (full blocks registered in the prefix cache, "
+                    "including blocks still referenced by running requests). "
+                    "Unlike vllm:kv_cache_usage_perc, which reports live-request "
+                    "occupancy, this reflects how much reusable content the "
+                    "prefix cache holds."
+                ),
+                labelnames=labelnames,
+            )
+            self.gauge_prefix_cache_blocks = create_metric_per_engine(
+                gauge_prefix_cache_blocks, per_engine_labelvalues
+            )
+
+            counter_prefix_cache_evicted_blocks = self._counter_cls(
+                name="vllm:prefix_cache_evicted_blocks",
+                documentation=(
+                    "Cumulative number of prefix cache blocks evicted to make "
+                    "room for new allocations."
+                ),
+                labelnames=labelnames,
+            )
+            self.counter_prefix_cache_evicted_blocks = create_metric_per_engine(
+                counter_prefix_cache_evicted_blocks, per_engine_labelvalues
+            )
         else:
             self.histogram_kv_block_lifetime = {}
             self.histogram_kv_block_idle_before_evict = {}
             self.histogram_kv_block_reuse_gap = {}
+            self.gauge_prefix_cache_blocks = {}
+            self.counter_prefix_cache_evicted_blocks = {}
 
         #
         # LoRA metrics
@@ -1121,6 +1151,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     idle_hist.observe(event.idle_seconds)
                     for gap in event.reuse_gaps_seconds:
                         reuse_hist.observe(gap)
+
+            if self.kv_cache_metrics_enabled:
+                self.gauge_prefix_cache_blocks[engine_idx].set(
+                    scheduler_stats.prefix_cache_blocks
+                )
+                self.counter_prefix_cache_evicted_blocks[engine_idx].inc(
+                    scheduler_stats.prefix_cache_evicted_blocks
+                )
 
             if self.gauge_lora_info is not None:
                 running_lora_adapters = ",".join(

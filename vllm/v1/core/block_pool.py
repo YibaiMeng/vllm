@@ -58,6 +58,10 @@ class BlockHashToBlockMap:
         self._cache: dict[
             BlockHashWithGroupId, KVCacheBlock | dict[int, KVCacheBlock]
         ] = {}
+        # Total number of blocks currently cached. Unlike __len__ (which counts
+        # distinct block hashes), this counts blocks, so it stays correct when
+        # multiple blocks share a hash.
+        self.num_blocks = 0
 
     def get_one_block(self, key: BlockHashWithGroupId) -> KVCacheBlock | None:
         """
@@ -76,6 +80,9 @@ class BlockHashToBlockMap:
         """
         Inserts the KVCacheBlock to the cache
         """
+        # Every insert adds exactly one block (callers only insert full blocks
+        # that are not already cached).
+        self.num_blocks += 1
         blocks = self._cache.get(key)
         if blocks is None:
             # When key is not found, attach a single block to the key
@@ -105,6 +112,7 @@ class BlockHashToBlockMap:
         # use del blocks[block_id] instead as followup.
         if isinstance(blocks, KVCacheBlock):
             if blocks.block_id == block_id:
+                self.num_blocks -= 1
                 return blocks
             # If the single block ID doesn't match, we should put the
             # block back (it should happen rarely)
@@ -114,6 +122,8 @@ class BlockHashToBlockMap:
             # Try to pop block_id from the block dict, and if dict still
             # contain blocks, put back to the cache.
             block = blocks.pop(block_id, None)
+            if block is not None:
+                self.num_blocks -= 1
             if len(blocks) > 0:
                 self._cache[key] = blocks
             return block
@@ -180,6 +190,10 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+        # Cumulative count of prefix-cache blocks evicted to make room for new
+        # allocations, reset to 0 each time it is drained by `make_stats`.
+        self.num_evicted_blocks = 0
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -387,6 +401,7 @@ class BlockPool:
             # eviction is not needed
             return False
 
+        self.num_evicted_blocks += 1
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -514,6 +529,31 @@ class BlockPool:
         if not total_gpu_blocks:
             return 0
         return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)
+
+    def get_num_cached_blocks(self) -> int:
+        """Get the number of blocks currently holding cached prefix content.
+
+        This counts full blocks registered in the prefix cache (including
+        blocks still referenced by running requests). Unlike `get_usage`,
+        which reports live-request occupancy and treats freed-but-cached
+        blocks as free, this reflects how much reusable content the prefix
+        cache holds.
+
+        Returns:
+            The number of cached blocks.
+        """
+        return self.cached_block_hash_to_block.num_blocks
+
+    def take_num_evicted_blocks(self) -> int:
+        """Get (and reset) the number of prefix-cache blocks evicted since the
+        last call.
+
+        Returns:
+            The number of blocks evicted from the prefix cache.
+        """
+        num_evicted_blocks = self.num_evicted_blocks
+        self.num_evicted_blocks = 0
+        return num_evicted_blocks
 
     def take_events(self) -> list[KVCacheEvent]:
         """Atomically takes all events and clears the queue.

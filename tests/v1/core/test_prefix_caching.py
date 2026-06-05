@@ -1437,6 +1437,7 @@ def test_cache_blocks(hash_fn):
     )
 
     assert len(block_pool.cached_block_hash_to_block) == 2
+    assert block_pool.get_num_cached_blocks() == 2
     assert all([block.block_hash is not None for block in blocks])
 
     # Test that blocks that don't start from the beginning are cached
@@ -1451,6 +1452,7 @@ def test_cache_blocks(hash_fn):
         kv_cache_group_id=0,
     )
     assert len(block_pool.cached_block_hash_to_block) == 3
+    assert block_pool.get_num_cached_blocks() == 3
     assert blocks[0].block_hash is not None
 
 
@@ -1899,12 +1901,18 @@ def test_maybe_evict_cached_block():
         block_hash1: block1,
         block_hash2: block2,
     }
+    # num_blocks counts blocks, not hashes (block0 and block3 share a hash).
+    assert pool.cached_block_hash_to_block.num_blocks == 4
+    assert pool.get_num_cached_blocks() == 4
+    assert pool.num_evicted_blocks == 0
     # Evict block1
     pool._maybe_evict_cached_block(block1)
     assert pool.cached_block_hash_to_block._cache == {
         block_hash0: {block0.block_id: block0, block3.block_id: block3},
         block_hash2: block2,
     }
+    assert pool.get_num_cached_blocks() == 3
+    assert pool.num_evicted_blocks == 1
     # Evict block0: block_hash0 entry should NOT be removed, as block3
     # also use the same hash
     pool._maybe_evict_cached_block(block0)
@@ -1912,12 +1920,23 @@ def test_maybe_evict_cached_block():
         block_hash0: {block3.block_id: block3},
         block_hash2: block2,
     }
+    assert pool.get_num_cached_blocks() == 2
+    assert pool.num_evicted_blocks == 2
     # Evict block2
     pool._maybe_evict_cached_block(block2)
     assert pool.cached_block_hash_to_block._cache == {block_hash0: {3: block3}}
+    assert pool.get_num_cached_blocks() == 1
+    assert pool.num_evicted_blocks == 3
     # Evict block3
     pool._maybe_evict_cached_block(block3)
     assert pool.cached_block_hash_to_block._cache == {}
+    assert pool.get_num_cached_blocks() == 0
+    assert pool.num_evicted_blocks == 4
+
+    # take_num_evicted_blocks drains the counter.
+    assert pool.take_num_evicted_blocks() == 4
+    assert pool.take_num_evicted_blocks() == 0
+    assert pool.num_evicted_blocks == 0
 
 
 @pytest.mark.parametrize("blocks_to_cache", [2, 3, 10])

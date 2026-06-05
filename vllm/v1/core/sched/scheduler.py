@@ -2013,11 +2013,18 @@ class Scheduler(SchedulerInterface):
         if self.connector_prefix_cache_stats is not None:
             connector_prefix_cache_stats = self.connector_prefix_cache_stats
             self.connector_prefix_cache_stats = PrefixCacheStats()
-        eviction_events = (
-            self.kv_metrics_collector.drain_events()
-            if self.kv_metrics_collector is not None
-            else []
-        )
+        # The prefix-cache occupancy/eviction metrics are gated behind the same
+        # `--kv-cache-metrics` flag as the residency histograms.
+        if self.kv_metrics_collector is not None:
+            eviction_events = self.kv_metrics_collector.drain_events()
+            prefix_cache_blocks = self.kv_cache_manager.get_num_cached_blocks()
+            prefix_cache_evicted_blocks = (
+                self.kv_cache_manager.take_num_evicted_blocks()
+            )
+        else:
+            eviction_events = []
+            prefix_cache_blocks = 0
+            prefix_cache_evicted_blocks = 0
         spec_stats = spec_decoding_stats
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
@@ -2030,6 +2037,8 @@ class Scheduler(SchedulerInterface):
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
+            prefix_cache_blocks=prefix_cache_blocks,
+            prefix_cache_evicted_blocks=prefix_cache_evicted_blocks,
             spec_decoding_stats=spec_stats,
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
