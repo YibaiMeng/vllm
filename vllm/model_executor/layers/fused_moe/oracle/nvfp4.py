@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
+    mxfp4_w4a16_moe_quant_config,
     nvfp4_moe_quant_config,
     nvfp4_w4a16_moe_quant_config,
 )
@@ -30,6 +31,8 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kMxfp4Static,
+    kNvfp4Static,
 )
 
 logger = init_logger(__name__)
@@ -166,6 +169,7 @@ def select_nvfp4_moe_backend(
     config: FusedMoEConfig,
     weight_key: QuantKey | None,
     activation_key: QuantKey | None,
+    use_mxfp4_w4a16: bool = False,
 ) -> tuple[NvFp4MoeBackend, type[mk.FusedMoEExperts]]:
     """
     Select the primary NvFP4 MoE backend
@@ -231,6 +235,46 @@ def select_nvfp4_moe_backend(
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[NvFp4MoeBackend, type[mk.FusedMoEExperts]]:
+        if use_mxfp4_w4a16:
+            if backend != NvFp4MoeBackend.FLASHINFER_TRTLLM:
+                raise ValueError(
+                    "MXFP4 W4A16 conversion requires moe_backend='flashinfer_trtllm'."
+                )
+            if weight_key != kNvfp4Static or activation_key is not None:
+                raise ValueError(
+                    "MXFP4 W4A16 conversion requires static NVFP4 weights "
+                    "and unquantized activations."
+                )
+            if config.in_dtype != torch.bfloat16:
+                raise ValueError(
+                    "FlashInfer TRTLLM MXFP4 W4A16 requires BF16 activations, "
+                    f"found {config.in_dtype}."
+                )
+            from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (  # noqa: E501
+                TrtLlmMxfp4ExpertsModular,
+                TrtLlmMxfp4ExpertsMonolithic,
+            )
+
+            for mxfp4_cls in (
+                TrtLlmMxfp4ExpertsMonolithic,
+                TrtLlmMxfp4ExpertsModular,
+            ):
+                supported, reason = mxfp4_cls.is_supported_config(
+                    mxfp4_cls,
+                    config,
+                    kMxfp4Static,
+                    None,
+                    activation_format,
+                )
+                if supported:
+                    logger.warning_once(
+                        "Using FlashInfer TRTLLM MXFP4-BF16 MoE for a "
+                        "ModelOpt W4A16_NVFP4 checkpoint; expert weights "
+                        "will be requantized at load time."
+                    )
+                    return backend, mxfp4_cls
+            raise ValueError(_make_log_unsupported(backend, reason))
+
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
                 k_cls, config, weight_key, activation_key, activation_format
@@ -304,6 +348,7 @@ def convert_to_nvfp4_moe_kernel_format(
     w2_scale_2: torch.Tensor,
     a2_scale: torch.Tensor | None,
     is_act_and_mul: bool,
+    use_mxfp4_w4a16: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -314,7 +359,45 @@ def convert_to_nvfp4_moe_kernel_format(
     torch.Tensor,
     torch.Tensor,
 ]:
-    if nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
+    if use_mxfp4_w4a16:
+        if nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM:
+            raise ValueError(
+                "MXFP4 W4A16 conversion requires the FlashInfer TRTLLM backend."
+            )
+        from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+            Mxfp4MoeBackend,
+            convert_weight_to_mxfp4_moe_kernel_format,
+        )
+        from vllm.model_executor.layers.quantization.utils.w4a16_flashinfer_trtllm import (  # noqa: E501
+            requantize_nvfp4_group16_to_mxfp4_group32,
+        )
+
+        w13, w13_scale, w13_stats = requantize_nvfp4_group16_to_mxfp4_group32(
+            w13, w13_scale, w13_scale_2
+        )
+        w2, w2_scale, w2_stats = requantize_nvfp4_group16_to_mxfp4_group32(
+            w2, w2_scale, w2_scale_2
+        )
+        w13, w2, w13_scale, w2_scale, _, _ = convert_weight_to_mxfp4_moe_kernel_format(
+            mxfp4_backend=Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
+            layer=layer,
+            w13_weight=w13,
+            w2_weight=w2,
+            w13_weight_scale=w13_scale,
+            w2_weight_scale=w2_scale,
+            _cache_permute_indices={},
+        )
+        logger.info(
+            "Requantized W4A16 expert weights from NVFP4 group-16 to "
+            "MXFP4 group-32: w13_relative_l1_error=%g, "
+            "w13_saturated_values=%d, w2_relative_l1_error=%g, "
+            "w2_saturated_values=%d",
+            w13_stats.relative_l1_error,
+            w13_stats.saturated_values,
+            w2_stats.relative_l1_error,
+            w2_stats.saturated_values,
+        )
+    elif nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
         (
             w13,
             w13_scale,
@@ -465,11 +548,22 @@ def make_nvfp4_moe_quant_config(
     w2_scale: torch.Tensor,
     w13_scale_2: torch.Tensor,
     w2_scale_2: torch.Tensor,
-    a13_scale: torch.Tensor,
-    a2_scale: torch.Tensor,
+    a13_scale: torch.Tensor | None,
+    a2_scale: torch.Tensor | None,
     swiglu_limit: float | None = None,
     layer: torch.nn.Module | None = None,
+    use_mxfp4_w4a16: bool = False,
 ) -> FusedMoEQuantConfig:
+    if use_mxfp4_w4a16:
+        if backend != NvFp4MoeBackend.FLASHINFER_TRTLLM:
+            raise ValueError(
+                "MXFP4 W4A16 quantization requires the FlashInfer TRTLLM backend."
+            )
+        return mxfp4_w4a16_moe_quant_config(
+            w1_scale=w13_scale,
+            w2_scale=w2_scale,
+            gemm1_clamp_limit=swiglu_limit,
+        )
     if backend == NvFp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe import RoutedExperts
         from vllm.model_executor.layers.quantization.utils.humming_utils import (
@@ -487,6 +581,7 @@ def make_nvfp4_moe_quant_config(
             gemm1_clamp_limit=swiglu_limit,
         )
     elif backend == NvFp4MoeBackend.EMULATION:
+        assert a13_scale is not None and a2_scale is not None
         return nvfp4_moe_quant_config(
             g1_alphas=w13_scale_2,
             g2_alphas=w2_scale_2,
@@ -501,6 +596,7 @@ def make_nvfp4_moe_quant_config(
     # The expert's process_weights_after_loading will fuse activation
     # scales in-place. Since the quant config references the same tensor
     # as the registered parameter, EPLB rearrangement stays in sync.
+    assert a13_scale is not None and a2_scale is not None
     return nvfp4_moe_quant_config(
         g1_alphas=w13_scale_2,
         g2_alphas=w2_scale_2,

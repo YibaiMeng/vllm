@@ -22,6 +22,7 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
+    FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     FusedMoeWeightScaleSupported,
     RoutedExperts,
@@ -33,6 +34,10 @@ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
     select_fp8_moe_backend,
+)
+from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+    Mxfp4MoeBackend,
+    mxfp4_round_up_hidden_size_and_intermediate_size,
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
@@ -1406,17 +1411,24 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     ) -> None:
         super().__init__(moe_config)
         self.quant_config = quant_config
-        # W4A16 mode fires for W4A16_NVFP4 on-disk checkpoints. With
-        # activation_key=None every W4A4 backend's _supports_quant_scheme
-        # rejects itself (they all require (kNvfp4Static, kNvfp4Dynamic)
-        # exactly); only Marlin survives. Marlin's MoE path drops
-        # activation scales in convert_to_nvfp4_moe_kernel_format, so no
-        # other change is needed.
         self.use_a16 = quant_config.quant_method == "W4A16_NVFP4"
+        if (
+            self.use_a16
+            and self.moe.moe_backend == "flashinfer_trtllm"
+            and self.moe.in_dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                "FlashInfer TRTLLM MXFP4 W4A16 requires BF16 activations, "
+                f"found {self.moe.in_dtype}."
+            )
+        self.use_mxfp4_w4a16 = (
+            self.use_a16 and self.moe.moe_backend == "flashinfer_trtllm"
+        )
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
             config=self.moe,
             weight_key=kNvfp4Static,
             activation_key=None if self.use_a16 else kNvfp4Dynamic,
+            use_mxfp4_w4a16=self.use_mxfp4_w4a16,
         )
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
@@ -1438,6 +1450,31 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         """
         return True
 
+    @property
+    def has_unpadded_output(self) -> bool:
+        return self.use_mxfp4_w4a16
+
+    def maybe_roundup_sizes(
+        self,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        act_dtype: torch.dtype,
+        moe_parallel_config: FusedMoEParallelConfig,
+    ) -> tuple[int, int]:
+        hidden_size, intermediate_size_per_partition = super().maybe_roundup_sizes(
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            act_dtype=act_dtype,
+            moe_parallel_config=moe_parallel_config,
+        )
+        if not self.use_mxfp4_w4a16:
+            return hidden_size, intermediate_size_per_partition
+        return mxfp4_round_up_hidden_size_and_intermediate_size(
+            Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
+            hidden_size,
+            intermediate_size_per_partition,
+        )
+
     def create_weights(
         self,
         layer: RoutedExperts,
@@ -1457,9 +1494,10 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
         global_num_experts = extra_weight_attrs.get("global_num_experts")
         w13_num_shards = 2 if self.moe.is_act_and_mul else 1
+        allocate = torch.zeros if self.use_mxfp4_w4a16 else torch.empty
         # GEMM 1
         w13_weight = ModelWeightParameter(
-            data=torch.empty(
+            data=allocate(
                 num_experts,
                 w13_num_shards * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
@@ -1474,7 +1512,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
         # GEMM 2
         w2_weight = ModelWeightParameter(
-            data=torch.empty(
+            data=allocate(
                 num_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
@@ -1488,7 +1526,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
 
         w13_weight_scale = ModelWeightParameter(
-            data=torch.empty(
+            data=allocate(
                 num_experts,
                 w13_num_shards * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
@@ -1502,7 +1540,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
         w2_weight_scale = ModelWeightParameter(
-            data=torch.empty(
+            data=allocate(
                 num_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
@@ -1559,15 +1597,18 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
 
-        # Use a single gscale for w13.
-        if self.moe.is_act_and_mul and not torch.allclose(
-            layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
-        ):
-            logger.warning_once(
-                "w1_weight_scale_2 must match w3_weight_scale_2. "
-                "Accuracy may be affected."
-            )
-        w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
+        if self.use_mxfp4_w4a16:
+            w13_weight_scale_2 = layer.w13_weight_scale_2.contiguous()
+        else:
+            # Existing NVFP4 kernels accept one global scale for W13.
+            if self.moe.is_act_and_mul and not torch.allclose(
+                layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
+            ):
+                logger.warning_once(
+                    "w1_weight_scale_2 must match w3_weight_scale_2. "
+                    "Accuracy may be affected."
+                )
+            w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0].contiguous()
 
         (
             w13,
@@ -1590,6 +1631,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             w2_scale_2=layer.w2_weight_scale_2,
             a2_scale=layer.w2_input_scale,
             is_act_and_mul=self.moe.is_act_and_mul,
+            use_mxfp4_w4a16=self.use_mxfp4_w4a16,
         )
 
         replace_parameter(layer, "w13_weight", w13)
@@ -1625,6 +1667,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
             layer=layer,
+            use_mxfp4_w4a16=self.use_mxfp4_w4a16,
         )
 
     @property

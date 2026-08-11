@@ -464,23 +464,18 @@ def test_modelopt_nvfp4_config_dispatches_w4a16_method():
 
 
 @pytest.mark.parametrize(
-    "quant_method, expected_use_a16, act_key_is_none",
+    "quant_method, moe_backend, expected_use_a16, expected_mxfp4_w4a16",
     [
-        ("NVFP4", False, False),  # W4A4 default
-        ("W4A16_NVFP4", True, True),  # native W4A16 ckpt
+        ("NVFP4", "auto", False, False),
+        ("W4A16_NVFP4", "auto", True, False),
+        ("W4A16_NVFP4", "marlin", True, False),
+        ("W4A16_NVFP4", "flashinfer_trtllm", True, True),
     ],
 )
-def test_modelopt_nvfp4_moe_dispatches_to_marlin_when_w4a16(
-    quant_method, expected_use_a16, act_key_is_none
+def test_modelopt_nvfp4_moe_dispatches_w4a16_backend(
+    quant_method, moe_backend, expected_use_a16, expected_mxfp4_w4a16
 ):
-    """``ModelOptNvFp4FusedMoE``: when the ckpt's ``quant_method`` is
-    ``W4A16_NVFP4``, the MoE class must pass ``activation_key=None`` to
-    ``select_nvfp4_moe_backend``. That filters out every W4A4 backend
-    (their ``_supports_quant_scheme`` requires
-    ``(kNvfp4Static, kNvfp4Dynamic)`` exactly); Marlin survives because
-    it only checks ``weight_key``. A regression here would mean a W4A16
-    ckpt silently went to the cutlass W4A4 path.
-    """
+    """The MXFP4 conversion is limited to explicit TRTLLM W4A16 use."""
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptNvFp4Config,
         ModelOptNvFp4FusedMoE,
@@ -498,6 +493,9 @@ def test_modelopt_nvfp4_moe_dispatches_to_marlin_when_w4a16(
         group_size=16,
     )
 
+    moe_config = MagicMock()
+    moe_config.moe_backend = moe_backend
+    moe_config.in_dtype = torch.bfloat16
     mock_select = MagicMock(return_value=(MagicMock(), MagicMock()))
     with (
         patch(
@@ -510,15 +508,241 @@ def test_modelopt_nvfp4_moe_dispatches_to_marlin_when_w4a16(
             return_value=False,
         ),
     ):
-        moe = ModelOptNvFp4FusedMoE(config, MagicMock())
+        moe = ModelOptNvFp4FusedMoE(config, moe_config)
 
     assert moe.use_a16 is expected_use_a16
+    assert moe.use_mxfp4_w4a16 is expected_mxfp4_w4a16
+    assert moe.has_unpadded_output is expected_mxfp4_w4a16
     _, kwargs = mock_select.call_args
     assert kwargs["weight_key"] is kNvfp4Static
-    if act_key_is_none:
+    assert kwargs["use_mxfp4_w4a16"] is expected_mxfp4_w4a16
+    if expected_use_a16:
         assert kwargs["activation_key"] is None
     else:
         assert kwargs["activation_key"] is kNvfp4Dynamic
+
+
+def test_modelopt_w4a16_trtllm_rejects_fp16_activations():
+    """The TRTLLM MXFP4 expert kernels accept BF16 activations only."""
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4Config,
+        ModelOptNvFp4FusedMoE,
+    )
+
+    config = ModelOptNvFp4Config(
+        quant_method="W4A16_NVFP4",
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+        group_size=16,
+    )
+    moe_config = MagicMock()
+    moe_config.moe_backend = "flashinfer_trtllm"
+    moe_config.in_dtype = torch.float16
+
+    with pytest.raises(ValueError, match="requires BF16 activations"):
+        ModelOptNvFp4FusedMoE(config, moe_config)
+
+
+def test_modelopt_w4a16_trtllm_uses_mxfp4_size_alignment():
+    """TRTLLM MXFP4 must pad hidden and intermediate dimensions to 256."""
+    from vllm.model_executor.layers.fused_moe import FusedMoEParallelConfig
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4Config,
+        ModelOptNvFp4FusedMoE,
+    )
+
+    config = ModelOptNvFp4Config(
+        quant_method="W4A16_NVFP4",
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+        group_size=16,
+    )
+    moe_config = MagicMock()
+    moe_config.moe_backend = "flashinfer_trtllm"
+    moe_config.in_dtype = torch.bfloat16
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.select_nvfp4_moe_backend",
+            return_value=(MagicMock(), MagicMock()),
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "is_global_sf_supported_for_nvfp4_backend",
+            return_value=False,
+        ),
+    ):
+        moe = ModelOptNvFp4FusedMoE(config, moe_config)
+
+    assert moe.maybe_roundup_sizes(
+        hidden_size=2303,
+        intermediate_size_per_partition=1234,
+        act_dtype=torch.bfloat16,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+    ) == (2304, 1280)
+
+
+def test_modelopt_w4a16_trtllm_zero_initializes_padded_weights():
+    """Checkpoint padding must remain numerically zero before requantization."""
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4Config,
+        ModelOptNvFp4FusedMoE,
+    )
+
+    config = ModelOptNvFp4Config(
+        quant_method="W4A16_NVFP4",
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+        group_size=16,
+    )
+    moe_config = MagicMock()
+    moe_config.moe_backend = "flashinfer_trtllm"
+    moe_config.in_dtype = torch.bfloat16
+    moe_config.is_act_and_mul = True
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.select_nvfp4_moe_backend",
+            return_value=(MagicMock(), MagicMock()),
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "is_global_sf_supported_for_nvfp4_backend",
+            return_value=False,
+        ),
+        patch(
+            "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
+            return_value=0,
+        ),
+        patch(
+            "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+            return_value=1,
+        ),
+    ):
+        moe = ModelOptNvFp4FusedMoE(config, moe_config)
+        layer = MagicMock()
+        layer.register_parameter.side_effect = lambda name, value: setattr(
+            layer, name, value
+        )
+        moe.create_weights(
+            layer=layer,
+            num_experts=1,
+            hidden_size=256,
+            intermediate_size_per_partition=256,
+            params_dtype=torch.bfloat16,
+        )
+
+    for name in (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale",
+        "w2_weight_scale",
+    ):
+        assert torch.count_nonzero(getattr(layer, name).data.view(torch.uint8)) == 0
+
+
+def test_modelopt_w4a16_selects_trtllm_mxfp4_experts():
+    """Explicit TRTLLM W4A16 dispatch must query the MXFP4 scheme."""
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
+        TrtLlmMxfp4ExpertsMonolithic,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        NvFp4MoeBackend,
+        select_nvfp4_moe_backend,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp4Static,
+        kNvfp4Static,
+    )
+
+    moe_config = MagicMock()
+    moe_config.moe_backend = "flashinfer_trtllm"
+    moe_config.swiglu_limit = None
+    moe_config.in_dtype = torch.bfloat16
+    moe_config.moe_parallel_config.use_batched_activation_format = False
+
+    with patch.object(
+        TrtLlmMxfp4ExpertsMonolithic,
+        "is_supported_config",
+        return_value=(True, None),
+    ) as supported:
+        backend, experts_cls = select_nvfp4_moe_backend(
+            config=moe_config,
+            weight_key=kNvfp4Static,
+            activation_key=None,
+            use_mxfp4_w4a16=True,
+        )
+
+    assert backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
+    assert experts_cls is TrtLlmMxfp4ExpertsMonolithic
+    assert supported.call_args.args[2:4] == (kMxfp4Static, None)
+
+
+def _decode_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    from vllm.model_executor.layers.quantization.utils.w4a16_flashinfer_trtllm import (  # noqa: E501
+        _decode_fp4,
+        _e8m0_values,
+    )
+
+    experts, rows, packed_k = weight.shape
+    groups = scale.shape[-1]
+    packed = weight.reshape(experts, rows, groups, packed_k // groups)
+    codes = torch.stack((packed & 0xF, packed >> 4), dim=-1).reshape(
+        experts, rows, groups, -1
+    )
+    return _decode_fp4(codes) * _e8m0_values(scale).unsqueeze(-1)
+
+
+def test_modelopt_w4a16_requantization_preserves_w13_global_scales():
+    """Distinct W1 and W3 scales must apply to their respective row halves."""
+    from vllm.model_executor.layers.quantization.utils.w4a16_flashinfer_trtllm import (  # noqa: E501
+        requantize_nvfp4_group16_to_mxfp4_group32,
+    )
+
+    weight = torch.full((1, 4, 16), 0x11, dtype=torch.uint8)
+    block_scale = torch.ones((1, 4, 2), dtype=torch.float8_e4m3fn)
+    global_scale = torch.tensor([[1.0, 4.0]], dtype=torch.float32)
+
+    converted_weight, converted_scale, stats = (
+        requantize_nvfp4_group16_to_mxfp4_group32(
+            weight,
+            block_scale,
+            global_scale,
+            max_chunk_elements=32,
+        )
+    )
+    decoded = _decode_mxfp4(converted_weight, converted_scale)
+
+    torch.testing.assert_close(decoded[:, :2], torch.full_like(decoded[:, :2], 0.5))
+    torch.testing.assert_close(decoded[:, 2:], torch.full_like(decoded[:, 2:], 2.0))
+    assert stats.saturated_values == 0
+
+
+def test_modelopt_w4a16_requantization_reports_loss():
+    """Merging unequal group-16 scales must report the resulting loss."""
+    from vllm.model_executor.layers.quantization.utils.w4a16_flashinfer_trtllm import (  # noqa: E501
+        requantize_nvfp4_group16_to_mxfp4_group32,
+    )
+
+    codes = torch.arange(16, dtype=torch.uint8).repeat(2)
+    weight = (codes[0::2] | (codes[1::2] << 4)).reshape(1, 1, 16)
+    block_scale = torch.tensor([[[0.5, 2.0]]], dtype=torch.float8_e4m3fn)
+
+    converted_weight, converted_scale, stats = (
+        requantize_nvfp4_group16_to_mxfp4_group32(
+            weight, block_scale, torch.tensor([1.25])
+        )
+    )
+
+    assert converted_weight.shape == weight.shape
+    assert converted_scale.shape == (1, 1, 1)
+    assert stats.elements == 32
+    assert stats.changed_codes > 0
+    assert 0.0 < stats.relative_l1_error < 0.5
+    assert stats.saturated_values == 0
 
 
 @pytest.mark.parametrize(
