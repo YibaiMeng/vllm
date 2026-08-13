@@ -85,20 +85,20 @@ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
     w13: torch.Tensor,
     w13_scale: torch.Tensor,
     w13_scale_2: torch.Tensor,
-    a13_scale: torch.Tensor,
+    a13_scale: torch.Tensor | None,
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
     w2_scale_2: torch.Tensor,
-    a2_scale: torch.Tensor,
+    a2_scale: torch.Tensor | None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
 ]:
     """Prepare weights for the CuteDSL wrapper-based NvFP4 MoE backend.
 
@@ -107,10 +107,13 @@ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
     """
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
-    # Global scaling factors (same as other FlashInfer backends).
     num_experts = w13.shape[0]
-    a13_scale = a13_scale.max().to(torch.float32).expand(num_experts)
-    a2_scale = a2_scale.max().to(torch.float32).expand(num_experts)
+    if (a13_scale is None) != (a2_scale is None):
+        raise ValueError("Both activation scales must be present or absent.")
+    if a13_scale is not None and a2_scale is not None:
+        # Global scaling factors (same as other FlashInfer backends).
+        a13_scale = a13_scale.max().to(torch.float32).expand(num_experts)
+        a2_scale = a2_scale.max().to(torch.float32).expand(num_experts)
 
     half = w13.shape[1] // 2
     w13 = torch.cat([w13[:, half:], w13[:, :half]], dim=1)

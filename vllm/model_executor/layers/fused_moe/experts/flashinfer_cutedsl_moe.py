@@ -22,6 +22,7 @@ from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     flashinfer_cute_dsl_fused_moe_nvfp4,
     has_flashinfer_cutedsl_moe_nvfp4,
+    has_flashinfer_cutedsl_moe_w4a16,
 )
 
 
@@ -43,10 +44,13 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             moe_config=moe_config,
             quant_config=quant_config,
         )
-        assert quant_config.quant_dtype == "nvfp4", (
-            "Only nvfp4 quantization is currently supported."
-        )
+        assert quant_config.weight_quant_dtype == "nvfp4" and (
+            quant_config.quant_dtype in ("nvfp4", None)
+        ), "Only NVFP4 weights with NVFP4 or BF16 activations are supported."
+        self.quant_mode = "w4a4" if quant_config.quant_dtype == "nvfp4" else "w4a16"
         self.out_dtype = moe_config.in_dtype
+        if self.quant_mode == "w4a16" and self.out_dtype != torch.bfloat16:
+            raise ValueError("FlashInfer CuTe DSL W4A16 MoE requires BF16 activations.")
         self.hidden_dim = moe_config.hidden_dim
         self.intermediate_size_per_partition = (
             moe_config.intermediate_size_per_partition
@@ -58,8 +62,9 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         self.local_expert_offset = self.ep_rank * self.local_num_experts
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
-        layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+        if self.quant_mode == "w4a4":
+            layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
+            layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -83,10 +88,12 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        SUPPORTED_W_A = [
-            (kNvfp4Static, kNvfp4Dynamic),
-        ]
-        return (weight_key, activation_key) in SUPPORTED_W_A
+        if (weight_key, activation_key) == (kNvfp4Static, kNvfp4Dynamic):
+            return True
+        return (weight_key, activation_key) == (
+            kNvfp4Static,
+            None,
+        ) and has_flashinfer_cutedsl_moe_w4a16()
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
@@ -114,8 +121,8 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         workspace1 = (0,)
         workspace2 = (0,)
-        # K is packed (K//2 for uint8), so output uses hidden_dim.
-        assert self.hidden_dim == K * 2
+        expected_hidden_dim = K * 2 if self.quant_mode == "w4a4" else K
+        assert self.hidden_dim == expected_hidden_dim
         output = (M, self.hidden_dim)
         return (workspace1, workspace2, output)
 
@@ -137,15 +144,28 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        assert self.quant_dtype == "nvfp4"
-        assert a1q_scale is not None
         assert self.w1_scale is not None
         assert self.w2_scale is not None
 
-        # a1q_scale is (M, K//16) float8_e4m3fn from fp4_quantize.
-        # The functional API expects x_sf with trailing dim: (M, K//16, 1).
-        x_sf = a1q_scale.unsqueeze(-1)
+        if self.quant_mode == "w4a4":
+            assert self.quant_dtype == "nvfp4"
+            assert a1q_scale is not None
+            # a1q_scale is (M, K//16) float8_e4m3fn from fp4_quantize.
+            # The functional API expects x_sf with trailing dim: (M, K//16, 1).
+            x_sf = a1q_scale.unsqueeze(-1)
+            fc2_input_scale = self.a2_gscale
+        else:
+            assert self.quant_dtype is None
+            assert hidden_states.dtype == torch.bfloat16
+            assert a1q_scale is None
+            x_sf = None
+            fc2_input_scale = None
 
+        quant_mode_kwargs = (
+            {"quant_mode": self.quant_mode}
+            if has_flashinfer_cutedsl_moe_w4a16()
+            else {}
+        )
         flashinfer_cute_dsl_fused_moe_nvfp4(
             x=hidden_states,
             x_sf=x_sf,
@@ -154,7 +174,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             w1_weight=w1,
             w1_weight_sf=self.w1_scale,
             w1_alpha=self.g1_alphas,
-            fc2_input_scale=self.a2_gscale,
+            fc2_input_scale=fc2_input_scale,
             w2_weight=w2,
             w2_weight_sf=self.w2_scale,
             w2_alpha=self.g2_alphas,
@@ -163,4 +183,5 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             num_local_experts=self.local_num_experts,
             local_expert_offset=self.local_expert_offset,
             moe_output=output,
+            **quant_mode_kwargs,
         )

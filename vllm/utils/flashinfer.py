@@ -9,6 +9,7 @@ import contextlib
 import functools
 import importlib
 import importlib.util
+import inspect
 import os
 import shutil
 from collections.abc import Callable
@@ -136,8 +137,9 @@ scaled_fp4_grouped_quantize = _lazy_import_wrapper(
 nvfp4_block_scale_interleave = _lazy_import_wrapper(
     "flashinfer.fp4_quantization", "block_scale_interleave"
 )
+_FLASHINFER_CUTEDSL_MOE_MODULE = "flashinfer.fused_moe.cute_dsl.fused_moe"
 flashinfer_cute_dsl_fused_moe_nvfp4 = _lazy_import_wrapper(
-    "flashinfer", "cute_dsl_fused_moe_nvfp4"
+    _FLASHINFER_CUTEDSL_MOE_MODULE, "cute_dsl_fused_moe_nvfp4"
 )
 flashinfer_convert_sf_to_mma_layout = _lazy_import_wrapper(
     "flashinfer.cute_dsl.utils", "convert_sf_to_mma_layout"
@@ -305,8 +307,23 @@ def has_flashinfer_cutedsl_moe_nvfp4() -> bool:
     """Return ``True`` if FlashInfer cute_dsl_fused_moe_nvfp4 is available."""
     if not has_flashinfer_cutedsl():
         return False
-    mod = _get_submodule("flashinfer")
+    mod = _get_submodule(_FLASHINFER_CUTEDSL_MOE_MODULE)
     return mod is not None and hasattr(mod, "cute_dsl_fused_moe_nvfp4")
+
+
+@functools.cache
+def has_flashinfer_cutedsl_moe_w4a16() -> bool:
+    """Return whether FlashInfer's CuTe DSL NVFP4 MoE supports W4A16."""
+    if not has_flashinfer_cutedsl_moe_nvfp4():
+        return False
+    mod = _get_submodule(_FLASHINFER_CUTEDSL_MOE_MODULE)
+    if mod is None:
+        return False
+    try:
+        parameters = inspect.signature(mod.cute_dsl_fused_moe_nvfp4).parameters
+    except (TypeError, ValueError):
+        return False
+    return "quant_mode" in parameters
 
 
 @functools.cache
@@ -1044,6 +1061,7 @@ __all__ = [
     "has_flashinfer_cutlass_fused_moe",
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
     "has_flashinfer_cutedsl_moe_nvfp4",
+    "has_flashinfer_cutedsl_moe_w4a16",
     "has_flashinfer_b12x_moe",
     "has_flashinfer_b12x_gemm",
     "has_flashinfer_fp8_blockscale_gemm",

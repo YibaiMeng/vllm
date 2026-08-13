@@ -308,11 +308,11 @@ def convert_to_nvfp4_moe_kernel_format(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
 ]:
     if nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
         (
@@ -465,8 +465,8 @@ def make_nvfp4_moe_quant_config(
     w2_scale: torch.Tensor,
     w13_scale_2: torch.Tensor,
     w2_scale_2: torch.Tensor,
-    a13_scale: torch.Tensor,
-    a2_scale: torch.Tensor,
+    a13_scale: torch.Tensor | None,
+    a2_scale: torch.Tensor | None,
     swiglu_limit: float | None = None,
     layer: torch.nn.Module | None = None,
 ) -> FusedMoEQuantConfig:
@@ -486,6 +486,16 @@ def make_nvfp4_moe_quant_config(
             w2_scale=w2_scale,
             gemm1_clamp_limit=swiglu_limit,
         )
+    elif backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL and a13_scale is None:
+        if a2_scale is not None:
+            raise ValueError("Both activation scales must be absent for W4A16.")
+        return nvfp4_w4a16_moe_quant_config(
+            g1_alphas=w13_scale_2,
+            g2_alphas=w2_scale_2,
+            w1_scale=w13_scale,
+            w2_scale=w2_scale,
+            gemm1_clamp_limit=swiglu_limit,
+        )
     elif backend == NvFp4MoeBackend.EMULATION:
         return nvfp4_moe_quant_config(
             g1_alphas=w13_scale_2,
@@ -496,6 +506,9 @@ def make_nvfp4_moe_quant_config(
             w2_scale=w2_scale,
             gemm1_clamp_limit=swiglu_limit,
         )
+
+    if a13_scale is None or a2_scale is None:
+        raise ValueError("W4A4 backends require both activation scales.")
 
     # Pass w13_scale_2 / w2_scale_2 directly as g1/g2_alphas.
     # The expert's process_weights_after_loading will fuse activation

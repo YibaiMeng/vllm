@@ -470,16 +470,13 @@ def test_modelopt_nvfp4_config_dispatches_w4a16_method():
         ("W4A16_NVFP4", True, True),  # native W4A16 ckpt
     ],
 )
-def test_modelopt_nvfp4_moe_dispatches_to_marlin_when_w4a16(
+def test_modelopt_nvfp4_moe_uses_unquantized_activation_key_for_w4a16(
     quant_method, expected_use_a16, act_key_is_none
 ):
     """``ModelOptNvFp4FusedMoE``: when the ckpt's ``quant_method`` is
     ``W4A16_NVFP4``, the MoE class must pass ``activation_key=None`` to
-    ``select_nvfp4_moe_backend``. That filters out every W4A4 backend
-    (their ``_supports_quant_scheme`` requires
-    ``(kNvfp4Static, kNvfp4Dynamic)`` exactly); Marlin survives because
-    it only checks ``weight_key``. A regression here would mean a W4A16
-    ckpt silently went to the cutlass W4A4 path.
+    ``select_nvfp4_moe_backend``. This keeps W4A4-only backends out while
+    allowing W4A16 backends such as Marlin and FlashInfer CuTe DSL.
     """
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptNvFp4Config,
@@ -519,6 +516,90 @@ def test_modelopt_nvfp4_moe_dispatches_to_marlin_when_w4a16(
         assert kwargs["activation_key"] is None
     else:
         assert kwargs["activation_key"] is kNvfp4Dynamic
+
+
+def test_flashinfer_cutedsl_w4a16_quant_config_has_no_activation_scales():
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        NvFp4MoeBackend,
+        make_nvfp4_moe_quant_config,
+    )
+
+    scales = [torch.ones(2) for _ in range(4)]
+    config = make_nvfp4_moe_quant_config(
+        backend=NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+        w13_scale=scales[0],
+        w2_scale=scales[1],
+        w13_scale_2=scales[2],
+        w2_scale_2=scales[3],
+        a13_scale=None,
+        a2_scale=None,
+    )
+
+    assert config.quant_dtype is None
+    assert config.weight_quant_dtype == "nvfp4"
+    assert config.a1_gscale is None
+    assert config.a2_gscale is None
+
+
+def test_flashinfer_cutedsl_w4a16_apply_keeps_bf16_activations():
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        nvfp4_w4a16_moe_quant_config,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (  # noqa: E501
+        FlashInferCuteDSLExperts,
+    )
+
+    experts = object.__new__(FlashInferCuteDSLExperts)
+    experts.quant_config = nvfp4_w4a16_moe_quant_config(
+        g1_alphas=torch.ones(2),
+        g2_alphas=torch.ones(2),
+        w1_scale=torch.ones(2),
+        w2_scale=torch.ones(2),
+    )
+    experts.quant_mode = "w4a16"
+    experts.global_num_experts = 2
+    experts.local_num_experts = 2
+    experts.local_expert_offset = 0
+    experts.topk = 1
+
+    hidden_states = torch.ones(2, 4, dtype=torch.bfloat16)
+    kernel = MagicMock()
+    with (
+        patch(
+            "vllm.model_executor.layers.fused_moe.experts."
+            "flashinfer_cutedsl_moe.has_flashinfer_cutedsl_moe_w4a16",
+            return_value=True,
+        ),
+        patch(
+            "vllm.model_executor.layers.fused_moe.experts."
+            "flashinfer_cutedsl_moe.flashinfer_cute_dsl_fused_moe_nvfp4",
+            kernel,
+        ),
+    ):
+        experts.apply(
+            output=torch.empty_like(hidden_states),
+            hidden_states=hidden_states,
+            w1=torch.ones(2, 8, 2, dtype=torch.uint8),
+            w2=torch.ones(2, 4, 2, dtype=torch.uint8),
+            topk_weights=torch.ones(2, 1),
+            topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+            activation=MoEActivation.SILU,
+            global_num_experts=2,
+            expert_map=None,
+            a1q_scale=None,
+            a2_scale=None,
+            workspace13=None,
+            workspace2=None,
+            expert_tokens_meta=None,
+            apply_router_weight_on_input=None,
+        )
+
+    kwargs = kernel.call_args.kwargs
+    assert kwargs["x"] is hidden_states
+    assert kwargs["x_sf"] is None
+    assert kwargs["fc2_input_scale"] is None
+    assert kwargs["quant_mode"] == "w4a16"
 
 
 @pytest.mark.parametrize(
