@@ -541,6 +541,25 @@ def test_flashinfer_cutedsl_w4a16_quant_config_has_no_activation_scales():
     assert config.a2_gscale is None
 
 
+def test_flashinfer_cutedsl_w4a16_rejects_fp16_config():
+    from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (  # noqa: E501
+        FlashInferCuteDSLExperts,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Static
+
+    supported, reason = FlashInferCuteDSLExperts.is_supported_config(
+        FlashInferCuteDSLExperts,
+        MagicMock(in_dtype=torch.float16),
+        kNvfp4Static,
+        None,
+        mk.FusedMoEActivationFormat.Standard,
+    )
+
+    assert not supported
+    assert reason == "kernel does not support torch.float16 W4A16 input/output dtype"
+
+
 def test_flashinfer_cutedsl_w4a16_apply_keeps_bf16_activations():
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.config import (

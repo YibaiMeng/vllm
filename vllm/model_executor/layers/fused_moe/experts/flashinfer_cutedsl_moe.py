@@ -71,6 +71,29 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         return mk.FusedMoEActivationFormat.Standard
 
     @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        if activation_key is None and moe_config.in_dtype != torch.bfloat16:
+            return (
+                False,
+                f"kernel does not support {moe_config.in_dtype} W4A16 "
+                "input/output dtype",
+            )
+
+        return mk.FusedMoEExperts.is_supported_config(
+            cls,
+            moe_config,
+            weight_key,
+            activation_key,
+            activation_format,
+        )
+
+    @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
         return (
