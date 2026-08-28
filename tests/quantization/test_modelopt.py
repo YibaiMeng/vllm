@@ -19,6 +19,7 @@ from vllm.model_executor.kernels.linear import (
     HummingNvFp4LinearKernel,
     MarlinNvFp4LinearKernel,
 )
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
@@ -234,6 +235,77 @@ def test_modelopt_mixed_precision_resolves_declared_packed_projection():
     assert config._resolve_quant_algo("model.layers.0.self_attn.qkv_proj") == "MXFP8"
 
 
+def test_modelopt_mixed_precision_resolves_packed_only_projection():
+    config = _mixed_precision_config(
+        {
+            "model.layers.0.self_attn.qkv_proj": {"quant_algo": "MXFP8"},
+        }
+    )
+    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+    assert config._resolve_quant_algo("model.layers.0.self_attn.qkv_proj") == "MXFP8"
+
+
+def test_modelopt_mixed_precision_rejects_partial_packed_projection():
+    config = _mixed_precision_config(
+        {
+            "model.layers.0.self_attn.qkv_proj": {"quant_algo": "MXFP8"},
+            "model.layers.0.self_attn.q_proj": {"quant_algo": "MXFP8"},
+        }
+    )
+    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Packed layer model\.layers\.0\.self_attn\.qkv_proj has "
+            r"missing quantized shards: .*k_proj.*v_proj"
+        ),
+    ):
+        config._resolve_quant_algo("model.layers.0.self_attn.qkv_proj")
+
+
+def test_modelopt_mixed_precision_rejects_mixed_packed_projection_algorithms():
+    config = _mixed_precision_config(
+        {
+            "model.layers.0.self_attn.q_proj": {"quant_algo": "MXFP8"},
+            "model.layers.0.self_attn.k_proj": {"quant_algo": "FP8"},
+            "model.layers.0.self_attn.v_proj": {"quant_algo": "MXFP8"},
+        }
+    )
+    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Packed layer model\.layers\.0\.self_attn\.qkv_proj has "
+            r"mixed quant_algo shards: .*q_proj=MXFP8.*k_proj=FP8.*v_proj=MXFP8"
+        ),
+    ):
+        config._resolve_quant_algo("model.layers.0.self_attn.qkv_proj")
+
+
+def test_modelopt_mixed_precision_rejects_conflicting_packed_declaration():
+    config = _mixed_precision_config(
+        {
+            "model.layers.0.self_attn.qkv_proj": {"quant_algo": "MXFP8"},
+            "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"},
+            "model.layers.0.self_attn.k_proj": {"quant_algo": "FP8"},
+            "model.layers.0.self_attn.v_proj": {"quant_algo": "FP8"},
+        }
+    )
+    config.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Packed layer model\.layers\.0\.self_attn\.qkv_proj has "
+            r"conflicting quant_algo declarations: direct=MXFP8, shards=FP8"
+        ),
+    ):
+        config._resolve_quant_algo("model.layers.0.self_attn.qkv_proj")
+
+
 def test_modelopt_mixed_precision_does_not_quantize_unlisted_fused_sibling():
     config = _mixed_precision_config(
         {
@@ -302,6 +374,104 @@ def test_modelopt_mixed_precision_infers_fused_gate_up_projection():
         method = config.get_quant_method(fake_layer, "model.layers.0.mlp.gate_up_proj")
 
     assert isinstance(method, ModelOptNvFp4LinearMethod)
+
+
+def test_modelopt_mixed_precision_rejects_partial_fallback_fused_projection():
+    config = _mixed_precision_config(
+        {
+            "model.layers.0.mlp.gate_up_proj": {"quant_algo": "NVFP4"},
+            "model.layers.0.mlp.gate_proj": {"quant_algo": "NVFP4"},
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Packed layer model\.layers\.0\.mlp\.gate_up_proj has "
+            r"missing quantized shards: .*up_proj"
+        ),
+    ):
+        config._resolve_quant_algo("model.layers.0.mlp.gate_up_proj")
+
+
+def test_modelopt_mixed_precision_leaves_w4a4_bf16_routed_experts_unquantized():
+    config = _mixed_precision_config(
+        {
+            "model.layers.0.mlp.shared_experts.gate_proj": {"quant_algo": "NVFP4"},
+            "model.layers.0.mlp.shared_experts.up_proj": {"quant_algo": "NVFP4"},
+            "model.layers.0.mlp.shared_experts.down_proj": {"quant_algo": "NVFP4"},
+        }
+    )
+    fake_layer = MagicMock(spec=RoutedExperts)
+    prefix = "model.layers.0.mlp.experts"
+
+    assert config._resolve_quant_algo(prefix) is None
+    assert config.get_quant_method(fake_layer, prefix) is None
+
+
+def test_modelopt_mixed_precision_resolves_declared_routed_experts():
+    config = _mixed_precision_config(
+        {
+            "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
+            "model.layers.0.mlp.shared_experts.gate_proj": {"quant_algo": "NVFP4"},
+            "model.layers.0.mlp.shared_experts.up_proj": {"quant_algo": "NVFP4"},
+            "model.layers.0.mlp.shared_experts.down_proj": {"quant_algo": "NVFP4"},
+        }
+    )
+    fake_layer = MagicMock(spec=RoutedExperts)
+    fake_layer.moe_config = MagicMock()
+    prefix = "model.layers.0.mlp.experts"
+    shared_prefix = "model.layers.0.mlp.shared_experts.gate_up_proj"
+
+    expected_method = MagicMock()
+    with patch(
+        "vllm.model_executor.layers.quantization.modelopt.ModelOptNvFp4FusedMoE",
+        return_value=expected_method,
+    ) as fused_moe:
+        method = config.get_quant_method(fake_layer, prefix)
+
+    assert method is expected_method
+    fused_moe.assert_called_once_with(
+        quant_config=config.nvfp4_config, moe_config=fake_layer.moe_config
+    )
+    assert config._resolve_quant_algo(shared_prefix) == "NVFP4"
+
+
+@pytest.mark.parametrize(
+    "quantized_layers, expected_pattern",
+    [
+        (
+            {
+                "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
+                "model.layers.0.mlp.experts.0.gate_proj": {"quant_algo": "NVFP4"},
+            },
+            (
+                r"RoutedExperts layer model\.layers\.0\.mlp\.experts has "
+                r"missing quantized shards: .*up_proj.*down_proj"
+            ),
+        ),
+        (
+            {
+                "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"},
+                "model.layers.0.mlp.experts.0.gate_proj": {"quant_algo": "NVFP4"},
+                "model.layers.0.mlp.experts.0.up_proj": {"quant_algo": "FP8"},
+                "model.layers.0.mlp.experts.0.down_proj": {"quant_algo": "NVFP4"},
+            },
+            (
+                r"RoutedExperts layer model\.layers\.0\.mlp\.experts has "
+                r"mixed quant_algo shards: "
+                r".*gate_proj=NVFP4.*up_proj=FP8.*down_proj=NVFP4"
+            ),
+        ),
+    ],
+)
+def test_modelopt_mixed_precision_rejects_incomplete_or_mixed_routed_experts(
+    quantized_layers, expected_pattern
+):
+    config = _mixed_precision_config(quantized_layers)
+
+    with pytest.raises(ValueError, match=expected_pattern):
+        config._resolve_quant_algo("model.layers.0.mlp.experts")
 
 
 @pytest.mark.parametrize(
@@ -598,22 +768,31 @@ def test_modelopt_w4a16_respects_linear_backend(linear_backend, kernel_cls):
 
 
 @pytest.mark.parametrize(
-    "quant_method, expected_use_a16, act_key_is_none",
+    "quant_method, moe_backend, expected_use_a16, act_key_is_none, backend_override",
     [
-        ("NVFP4", False, False),  # W4A4 default
-        ("W4A16_NVFP4", True, True),  # native W4A16 ckpt
+        ("NVFP4", "flashinfer_cutlass", False, False, None),
+        ("W4A16_NVFP4", "auto", True, True, None),
+        ("W4A16_NVFP4", "flashinfer_b12x", True, True, "marlin"),
+        ("W4A16_NVFP4", "flashinfer_cutlass", True, True, "marlin"),
+        ("W4A16_NVFP4", "flashinfer_cutedsl", True, True, "marlin"),
+        ("W4A16_NVFP4", "flashinfer_trtllm", True, True, "marlin"),
+        ("W4A16_NVFP4", "cutlass", True, True, None),
+        ("W4A16_NVFP4", "emulation", True, True, None),
+        ("W4A16_NVFP4", "humming", True, True, None),
     ],
 )
 def test_modelopt_nvfp4_moe_dispatches_to_marlin_when_w4a16(
-    quant_method, expected_use_a16, act_key_is_none
+    quant_method,
+    moe_backend,
+    expected_use_a16,
+    act_key_is_none,
+    backend_override,
 ):
     """``ModelOptNvFp4FusedMoE``: when the ckpt's ``quant_method`` is
-    ``W4A16_NVFP4``, the MoE class must pass ``activation_key=None`` to
-    ``select_nvfp4_moe_backend``. That filters out every W4A4 backend
-    (their ``_supports_quant_scheme`` requires
-    ``(kNvfp4Static, kNvfp4Dynamic)`` exactly); Marlin survives because
-    it only checks ``weight_key``. A regression here would mean a W4A16
-    ckpt silently went to the cutlass W4A4 path.
+    ``W4A16_NVFP4``, the MoE class must pass ``activation_key=None``. Automatic
+    selection can discover Marlin from that quantization pair. Explicit
+    FlashInfer W4A4 choices are overridden locally because they cannot accept
+    the protected layer's W4A16 activation format.
     """
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptNvFp4Config,
@@ -644,11 +823,15 @@ def test_modelopt_nvfp4_moe_dispatches_to_marlin_when_w4a16(
             return_value=False,
         ),
     ):
-        moe = ModelOptNvFp4FusedMoE(config, MagicMock())
+        moe_config = MagicMock()
+        moe_config.moe_backend = moe_backend
+        moe = ModelOptNvFp4FusedMoE(config, moe_config)
 
     assert moe.use_a16 is expected_use_a16
+    assert moe_config.moe_backend == moe_backend
     _, kwargs = mock_select.call_args
     assert kwargs["weight_key"] is kNvfp4Static
+    assert kwargs["backend_override"] == backend_override
     if act_key_is_none:
         assert kwargs["activation_key"] is None
     else:

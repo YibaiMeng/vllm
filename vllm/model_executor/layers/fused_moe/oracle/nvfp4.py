@@ -183,6 +183,7 @@ def select_nvfp4_moe_backend(
     config: FusedMoEConfig,
     weight_key: QuantKey | None,
     activation_key: QuantKey | None,
+    backend_override: MoEBackend | None = None,
 ) -> tuple[NvFp4MoeBackend, type[mk.FusedMoEExperts]]:
     """
     Select the primary NvFP4 MoE backend
@@ -264,7 +265,7 @@ def select_nvfp4_moe_backend(
         raise ValueError(_make_log_unsupported(backend, reason))
 
     # Handle explicit moe_backend from user.
-    runner_backend = config.moe_backend
+    runner_backend = backend_override or config.moe_backend
     if runner_backend != "auto":
         requested_backend = map_nvfp4_backend(runner_backend)
         if _use_a16(requested_backend, False):

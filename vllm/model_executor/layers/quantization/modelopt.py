@@ -9,6 +9,7 @@ from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config
+from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     init_fp8_linear_kernel,
@@ -1407,10 +1408,23 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         # activation scales in convert_to_nvfp4_moe_kernel_format, so no
         # other change is needed.
         self.use_a16 = quant_config.quant_method == "W4A16_NVFP4"
+        backend_override: MoEBackend | None = (
+            "marlin"
+            if self.use_a16
+            and self.moe.moe_backend
+            in (
+                "flashinfer_b12x",
+                "flashinfer_cutlass",
+                "flashinfer_cutedsl",
+                "flashinfer_trtllm",
+            )
+            else None
+        )
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
             config=self.moe,
             weight_key=kNvfp4Static,
             activation_key=None if self.use_a16 else kNvfp4Dynamic,
+            backend_override=backend_override,
         )
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
@@ -2305,71 +2319,182 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         Returns the upper-cased quant_algo string, or *None* if the prefix
         is not found.
         """
+        proj_name = prefix.rsplit(".", 1)[-1]
+        fused_projection_shards = {
+            "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+            "gate_up_proj": ("gate_proj", "up_proj"),
+        }
+        is_packed_projection = (
+            self.packed_modules_mapping is not None
+            and proj_name in self.packed_modules_mapping
+        ) or proj_name in fused_projection_shards
+        is_routed_experts = prefix.endswith(".experts")
+
         # 1. Direct lookup
+        direct_quant_algo = None
         for candidate in self._quantized_layer_prefix_candidates(prefix):
             if candidate in self.quantized_layers:
-                return self.quantized_layers[candidate]["quant_algo"].upper()
+                direct_quant_algo = self.quantized_layers[candidate][
+                    "quant_algo"
+                ].upper()
+                break
+        if direct_quant_algo is not None and not (
+            is_packed_projection or is_routed_experts
+        ):
+            return direct_quant_algo
 
         # 2. Packed / fused layer lookup
-        proj_name = prefix.rsplit(".", 1)[-1]
         if self.packed_modules_mapping and proj_name in self.packed_modules_mapping:
-            algos: set[str] = set()
             base = prefix.rsplit(".", 1)[0]
-            for base_candidate in self._quantized_layer_prefix_candidates(base):
-                for shard_name in self.packed_modules_mapping[proj_name]:
-                    shard_prefix = f"{base_candidate}.{shard_name}"
-                    if shard_prefix in self.quantized_layers:
-                        algos.add(
-                            self.quantized_layers[shard_prefix]["quant_algo"].upper()
-                        )
-            if len(algos) == 1:
-                return algos.pop()
-            if len(algos) > 1:
-                raise ValueError(
-                    f"Mixed quant_algo within fused layer {prefix}: "
-                    f"{algos}. All shards must use the same quantization."
+            shard_names = self.packed_modules_mapping[proj_name]
+            shard_prefix_groups = tuple(
+                tuple(f"{base_candidate}.{shard_name}" for shard_name in shard_names)
+                for base_candidate in self._quantized_layer_prefix_candidates(base)
+            )
+            quant_algo = self._resolve_packed_quant_algo(prefix, shard_prefix_groups)
+            if quant_algo is not None:
+                return self._resolve_declared_quant_algo(
+                    prefix, direct_quant_algo, quant_algo, "Packed layer"
                 )
 
         # 3. Prefix-based lookup (for RoutedExperts / parent modules)
+        if is_routed_experts:
+            quant_algo = self._resolve_routed_experts_quant_algo(prefix)
+            return self._resolve_declared_quant_algo(
+                prefix, direct_quant_algo, quant_algo, "RoutedExperts layer"
+            )
+
         for candidate in self._quantized_layer_prefix_candidates(prefix):
             prefix_dot = candidate + "."
             for key, info in self.quantized_layers.items():
                 if key.startswith(prefix_dot):
                     return info["quant_algo"].upper()
 
-        # RoutedExperts expert prefix is e.g. "...moe.experts", while ModelOpt's
-        # quantized_layers entries use "...moe.gate_proj" / "...moe.up_proj".
-        if prefix.endswith(".experts"):
-            parent_dot = prefix.rsplit(".experts", 1)[0] + "."
-            for key, info in self.quantized_layers.items():
-                if key.startswith(parent_dot):
-                    return info["quant_algo"].upper()
-
         # 4. Parent-prefix fallback for fused projections whose config lists
         # shard names instead of vLLM's packed module name.
-        fused_projection_shards = {
-            "qkv_proj": ("q_proj", "k_proj", "v_proj"),
-            "gate_up_proj": ("gate_proj", "up_proj"),
-        }
-        shard_names = fused_projection_shards.get(proj_name)
-        if shard_names is not None:
-            for candidate in self._quantized_layer_prefix_candidates(prefix):
-                parent_dot = candidate.rsplit(".", 1)[0] + "."
-                shard_algos: set[str] = set()
-                for shard_name in shard_names:
-                    shard_prefix = f"{parent_dot}{shard_name}"
-                    if shard_prefix in self.quantized_layers:
-                        algo = self.quantized_layers[shard_prefix]["quant_algo"].upper()
-                        shard_algos.add(algo)
-                if len(shard_algos) == 1:
-                    return shard_algos.pop()
-                if len(shard_algos) > 1:
-                    raise ValueError(
-                        f"Mixed quant_algo within fused layer {prefix}: "
-                        f"{shard_algos}. All shards must use the same quantization."
-                    )
+        fallback_shard_names = fused_projection_shards.get(proj_name)
+        if fallback_shard_names is not None:
+            shard_prefix_groups = tuple(
+                tuple(
+                    f"{candidate.rsplit('.', 1)[0]}.{shard_name}"
+                    for shard_name in fallback_shard_names
+                )
+                for candidate in self._quantized_layer_prefix_candidates(prefix)
+            )
+            quant_algo = self._resolve_packed_quant_algo(prefix, shard_prefix_groups)
+            if quant_algo is not None:
+                return self._resolve_declared_quant_algo(
+                    prefix, direct_quant_algo, quant_algo, "Packed layer"
+                )
 
-        return None
+        return direct_quant_algo
+
+    @staticmethod
+    def _resolve_declared_quant_algo(
+        prefix: str,
+        direct_quant_algo: str | None,
+        shard_quant_algo: str | None,
+        layer_kind: str,
+    ) -> str | None:
+        if shard_quant_algo is None:
+            return direct_quant_algo
+        if direct_quant_algo is not None and direct_quant_algo != shard_quant_algo:
+            raise ValueError(
+                f"{layer_kind} {prefix} has conflicting quant_algo declarations: "
+                f"direct={direct_quant_algo}, shards={shard_quant_algo}."
+            )
+        return shard_quant_algo
+
+    def _resolve_routed_experts_quant_algo(self, prefix: str) -> str | None:
+        """Resolve RoutedExperts only from a complete, uniform declaration."""
+        projection_names = ("gate_proj", "up_proj", "down_proj")
+        shard_prefix_groups: list[tuple[str, ...]] = []
+        for candidate in self._quantized_layer_prefix_candidates(prefix):
+            prefix_dot = candidate + "."
+            child_prefixes = {
+                key.rsplit(".", 1)[0]
+                for key in self.quantized_layers
+                if key.startswith(prefix_dot)
+                and key.rsplit(".", 1)[-1] in projection_names
+            }
+            shard_prefix_groups.extend(
+                tuple(
+                    f"{child_prefix}.{projection_name}"
+                    for projection_name in projection_names
+                )
+                for child_prefix in sorted(child_prefixes)
+            )
+
+        quant_algo = self._resolve_packed_quant_algo(
+            prefix,
+            tuple(shard_prefix_groups),
+            layer_kind="RoutedExperts layer",
+        )
+        if quant_algo is not None:
+            return quant_algo
+
+        parent_shard_groups = tuple(
+            tuple(
+                f"{candidate.rsplit('.experts', 1)[0]}.{projection_name}"
+                for projection_name in projection_names
+            )
+            for candidate in self._quantized_layer_prefix_candidates(prefix)
+        )
+        return self._resolve_packed_quant_algo(
+            prefix,
+            parent_shard_groups,
+            layer_kind="RoutedExperts layer",
+        )
+
+    def _resolve_packed_quant_algo(
+        self,
+        prefix: str,
+        shard_prefix_groups: tuple[tuple[str, ...], ...],
+        layer_kind: str = "Packed layer",
+    ) -> str | None:
+        """Resolve a packed layer only when every declared shard agrees."""
+        resolved_shard_algos: dict[str, str] = {}
+        for shard_prefixes in shard_prefix_groups:
+            declared_shards = {
+                shard_prefix: self.quantized_layers[shard_prefix]["quant_algo"].upper()
+                for shard_prefix in shard_prefixes
+                if shard_prefix in self.quantized_layers
+            }
+            if not declared_shards:
+                continue
+
+            missing_shards = [
+                shard_prefix
+                for shard_prefix in shard_prefixes
+                if shard_prefix not in declared_shards
+            ]
+            if missing_shards:
+                raise ValueError(
+                    f"{layer_kind} {prefix} has missing quantized shards: "
+                    f"{', '.join(missing_shards)}."
+                )
+
+            algos = set(declared_shards.values())
+            if len(algos) > 1:
+                shard_algos = ", ".join(
+                    f"{shard_prefix}={algo}"
+                    for shard_prefix, algo in declared_shards.items()
+                )
+                raise ValueError(
+                    f"{layer_kind} {prefix} has mixed quant_algo shards: {shard_algos}."
+                )
+            resolved_shard_algos.update(declared_shards)
+
+        resolved_algos = set(resolved_shard_algos.values())
+        if len(resolved_algos) > 1:
+            shard_algos = ", ".join(
+                f"{shard_prefix}={algo}"
+                for shard_prefix, algo in resolved_shard_algos.items()
+            )
+            raise ValueError(
+                f"{layer_kind} {prefix} has mixed quant_algo shards: {shard_algos}."
+            )
+        return next(iter(resolved_algos), None)
 
     @staticmethod
     def _quantized_layer_prefix_candidates(prefix: str) -> tuple[str, ...]:
