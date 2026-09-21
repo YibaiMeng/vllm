@@ -21,6 +21,9 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.gdn_metadata import (
+    prepare_full_graph_align_pure_spec_metadata,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 
 
@@ -206,6 +209,90 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             ),
         )
 
+    def _try_build_full_graph_align_pure_spec_metadata(
+        self,
+        m: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None,
+    ) -> GDNAttentionMetadata | None:
+        if (
+            m.block_table_tensor.device.type != "cuda"
+            or not self.use_full_cuda_graph
+            or not self.use_spec_decode
+            or self.vllm_config.cache_config.mamba_cache_mode != "align"
+            or num_accepted_tokens is None
+            or num_decode_draft_tokens_cpu is None
+        ):
+            return None
+
+        query_lens_cpu = m.query_start_loc_cpu[1:] - m.query_start_loc_cpu[:-1]
+        spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+        if not torch.equal(spec_sequence_masks_cpu, query_lens_cpu > 0):
+            return None
+
+        num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
+        if not bool(spec_sequence_masks_cpu[:num_spec_decodes].all()) or bool(
+            spec_sequence_masks_cpu[num_spec_decodes:].any()
+        ):
+            return None
+        if (
+            num_spec_decodes == 0
+            or int(num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item())
+            == 0
+        ):
+            return None
+
+        num_spec_decode_tokens = int(query_lens_cpu.sum().item())
+        batch_size = m.num_reqs
+        if (
+            num_spec_decodes > self.decode_cudagraph_max_bs
+            or num_spec_decode_tokens > self.decode_cudagraph_max_bs
+            or num_spec_decode_tokens > num_spec_decodes * (self.num_spec + 1)
+            or batch_size > self.decode_cudagraph_max_bs
+            or self.num_spec > self.kv_cache_spec.num_speculative_blocks
+            or self.num_spec + 1 > 16
+            or bool((query_lens_cpu[:num_spec_decodes] > self.num_spec + 1).any())
+        ):
+            return None
+
+        spec_token_size = min(
+            num_spec_decodes * (self.num_spec + 1),
+            int(m.query_start_loc_cpu[num_spec_decodes].item()),
+        )
+        prepare_full_graph_align_pure_spec_metadata(
+            m.block_table_tensor,
+            m.seq_lens,
+            m.query_start_loc,
+            num_accepted_tokens,
+            self.spec_state_indices_tensor,
+            self.spec_sequence_masks,
+            self.spec_token_indx,
+            self.spec_query_start_loc,
+            self.num_accepted_tokens,
+            num_spec_decodes,
+            batch_size,
+            spec_token_size,
+            self.kv_cache_spec.block_size,
+        )
+
+        return GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=num_spec_decodes,
+            num_spec_decode_tokens=num_spec_decode_tokens,
+            num_actual_tokens=m.num_actual_tokens,
+            spec_query_start_loc=self.spec_query_start_loc[: batch_size + 1],
+            non_spec_query_start_loc=None,
+            spec_state_indices_tensor=self.spec_state_indices_tensor[:batch_size],
+            non_spec_state_indices_tensor=None,
+            spec_sequence_masks=self.spec_sequence_masks[:batch_size],
+            spec_token_indx=self.spec_token_indx[:spec_token_size],
+            non_spec_token_indx=self.non_spec_token_indx[:0],
+            num_accepted_tokens=self.num_accepted_tokens[:batch_size],
+        )
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -215,6 +302,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+
+        fast_metadata = self._try_build_full_graph_align_pure_spec_metadata(
+            m, num_accepted_tokens, num_decode_draft_tokens_cpu
+        )
+        if fast_metadata is not None:
+            return fast_metadata
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
