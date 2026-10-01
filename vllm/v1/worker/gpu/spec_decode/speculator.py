@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -226,6 +227,7 @@ class DraftModelSpeculator(BaseSpeculator):
             ).keys()
         )
         self.draft_attn_layer_names = all_attn_layers - target_attn_layer_names
+        self._apply_draft_attn_window()
 
         target_supports_mm = MULTIMODAL_REGISTRY.supports_multimodal_inputs(
             self.vllm_config.model_config
@@ -253,6 +255,39 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.num_speculative_steps,
                 self.device,
             )
+
+    def _apply_draft_attn_window(self) -> None:
+        """Restrict the drafter's attention to the last N tokens (experimental).
+
+        Only the attention kernel's window changes: the KV cache spec and the
+        draft KV writes stay those of full attention, so the target model and
+        its verification are untouched and only draft proposals can differ.
+        """
+        window = envs.VLLM_MTP_DRAFT_ATTN_WINDOW
+        if window <= 0:
+            return
+        layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,  # type: ignore[type-abstract]
+            self.draft_attn_layer_names,
+        )
+        for name, layer in layers.items():
+            impl = getattr(layer, "impl", None)
+            if impl is None or getattr(impl, "window_left", None) != -1:
+                raise ValueError(
+                    f"VLLM_MTP_DRAFT_ATTN_WINDOW needs a full-attention draft "
+                    f"layer with a `window_left` kernel argument (FlashInfer); "
+                    f"{name} has {type(impl).__name__}."
+                )
+            # The FlashInfer trtllm-gen kernels read impl.window_left directly;
+            # its native-wrapper paths assert it equals the planned window, so
+            # an unsupported path fails loudly instead of silently ignoring it.
+            impl.window_left = window - 1
+        logger.info(
+            "Draft attention window: last %d tokens for layers %s",
+            window,
+            sorted(layers),
+        )
 
     def set_eplb_state(self, eplb_state: EplbState) -> None:
         """Inject EPLB state after construction."""
