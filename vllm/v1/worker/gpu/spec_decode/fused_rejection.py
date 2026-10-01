@@ -46,9 +46,14 @@ from vllm.v1.worker.gpu.sample.spec_topk_topp import (
 )
 
 # Vocab block per program of the first kernel and the sub-block granularity of
-# the survivor search. The second kernel loads KP sub-blocks (KP * SUB logits).
-_BLOCK_SIZE = 4096
-_SUB_SIZE = 128
+# the survivor search. The second kernel loads KP sub-blocks (KP * SUB logits),
+# chosen in two levels (groups of _GROUP sub-blocks) when there are enough.
+# Launch configuration tuned on VR (sm_107) by sweep_fused.py.
+_BLOCK_SIZE = 2048
+_SUB_SIZE = 32
+_GROUP = 16
+_SUBMAX_WARPS = 4
+_SELECT_WARPS = 8
 
 
 @triton.jit
@@ -212,6 +217,8 @@ def _select_survivors_kernel(
     KP: tl.constexpr,
     SUB_SIZE: tl.constexpr,
     PADDED_NUM_SUB: tl.constexpr,
+    # 0, or the sub-blocks per group of a two-level selection.
+    GROUP: tl.constexpr,
     HAS_PENALTIES: tl.constexpr,
     TOP_P: tl.constexpr,
 ):
@@ -220,14 +227,36 @@ def _select_survivors_kernel(
     top_k = tl.load(top_k_ptr + req_state_idx)
     temp = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
 
-    # 1. The KP sub-blocks with the largest (max, -index) keys.
-    sub = tl.arange(0, PADDED_NUM_SUB)
-    submax = tl.load(
-        submax_ptr + row * submax_stride + sub,
-        mask=sub < num_sub,
-        other=float("-inf"),
-    )
-    top_sub = tl.topk(_pack_keys(submax, sub, PADDED_NUM_SUB), KP)
+    # 1. The KP sub-blocks with the largest (max, -index) keys. Two-level: the
+    # same argument one level up puts them inside the KP groups (contiguous
+    # runs of GROUP sub-blocks) with the largest (max, -index) keys.
+    if GROUP > 0:
+        NUM_GROUPS: tl.constexpr = PADDED_NUM_SUB // GROUP
+        grp = tl.arange(0, NUM_GROUPS)
+        sub = grp[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
+        submax = tl.load(
+            submax_ptr + row * submax_stride + sub,
+            mask=sub < num_sub,
+            other=float("-inf"),
+        )
+        top_grp = tl.topk(_pack_keys(tl.max(submax, axis=1), grp, NUM_GROUPS), KP)
+        _, grp_idx = _unpack_keys(top_grp, NUM_GROUPS)
+        sub = grp_idx[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
+        submax = tl.load(
+            submax_ptr + row * submax_stride + sub,
+            mask=sub < num_sub,
+            other=float("-inf"),
+        )
+        sub_keys = tl.reshape(_pack_keys(submax, sub, PADDED_NUM_SUB), (KP * GROUP,))
+    else:
+        sub = tl.arange(0, PADDED_NUM_SUB)
+        submax = tl.load(
+            submax_ptr + row * submax_stride + sub,
+            mask=sub < num_sub,
+            other=float("-inf"),
+        )
+        sub_keys = _pack_keys(submax, sub, PADDED_NUM_SUB)
+    top_sub = tl.topk(sub_keys, KP)
     _, sub_idx = _unpack_keys(top_sub, PADDED_NUM_SUB)
 
     # 2. Their processed logits.
@@ -489,6 +518,9 @@ def select_survivors(
     kp = _top_k_pow2(max_top_k)
     num_blocks = triton.cdiv(vocab_size, _BLOCK_SIZE)
     num_sub = num_blocks * (_BLOCK_SIZE // _SUB_SIZE)
+    # At least KP wide, so topk returns KP distinct (possibly empty) sub-blocks
+    # when the vocab has fewer sub-blocks than KP.
+    padded_num_sub = max(triton.next_power_of_2(num_sub), kp)
     submax = torch.empty(num_logits, num_sub, dtype=torch.float32, device=device)
     surv_val = torch.empty(num_logits, kp, dtype=torch.float32, device=device)
     surv_idx = torch.empty(num_logits, kp, dtype=torch.int32, device=device)
@@ -528,7 +560,7 @@ def select_survivors(
         BLOCK_SIZE=_BLOCK_SIZE,
         SUB_SIZE=_SUB_SIZE,
         HAS_PENALTIES=has_penalties,
-        num_warps=8,
+        num_warps=_SUBMAX_WARPS,
     )
     _select_survivors_kernel[(num_logits,)](
         surv_val,
@@ -557,12 +589,11 @@ def select_survivors(
         vocab_size,
         KP=kp,
         SUB_SIZE=_SUB_SIZE,
-        # At least KP wide, so topk returns KP distinct (possibly empty)
-        # sub-blocks when the vocab has fewer sub-blocks than KP.
-        PADDED_NUM_SUB=max(triton.next_power_of_2(num_sub), kp),
+        PADDED_NUM_SUB=padded_num_sub,
+        GROUP=_GROUP if _GROUP and padded_num_sub // _GROUP >= kp else 0,
         HAS_PENALTIES=has_penalties,
         TOP_P=use_top_p,
-        num_warps=8,
+        num_warps=_SELECT_WARPS,
     )
     return surv_val, surv_idx, num_surv, lse
 
