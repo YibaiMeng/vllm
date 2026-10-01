@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
+
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -33,6 +36,93 @@ from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 
 logger = init_logger(__name__)
+
+
+# Routing methods FlashInfer serves with routingCustom (Block / DynBlock kernels
+# at T <= 16). DeepSeekV3 qualifies only without expert groups (n_group <= 1);
+# grouped DeepSeekV3 runs routingDeepSeek (Cluster kernel) and Llama4 its own
+# routing, so neither is allowed.
+_SM107_MOE_PDL_ROUTING = frozenset(
+    {
+        RoutingMethodType.Default,
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
+        RoutingMethodType.TopK,
+        RoutingMethodType.SigmoidRenorm,
+        RoutingMethodType.Sigmoid,
+        RoutingMethodType.MiniMax2,
+        RoutingMethodType.DeepSeekV3,
+    }
+)
+# SigmoidBias policy (DeepSeekV3 with n_group <= 1, MiniMax2): top_k 23-32
+# dispatches to Tier<1024, 32>, whose T = 5..16 calls take the Cluster path.
+_SM107_MOE_PDL_SIGMOID_BIAS_MAX_TOP_K = 22
+
+
+def _sm107_moe_pdl_allowed(
+    num_tokens: int,
+    num_experts: int,
+    hidden_size: int,
+    routing_method: RoutingMethodType,
+    n_group: int | None,
+    top_k: int,
+) -> bool:
+    """Whether one trtllm-gen MoE call stays on the kernels the SM107 PDL
+    opt-in was validated for (see ``_sm107_moe_pdl``); platform not checked.
+    """
+    if not (
+        0 < num_tokens <= envs.VLLM_FI_SM107_MOE_PDL_MAX_TOKENS
+        and num_experts <= 512
+        and (hidden_size + 255) // 256 * num_tokens < 1184
+        and routing_method in _SM107_MOE_PDL_ROUTING
+    ):
+        return False
+    if routing_method == RoutingMethodType.DeepSeekV3 and (n_group or 0) > 1:
+        return False
+    sigmoid_bias = routing_method in (
+        RoutingMethodType.DeepSeekV3,
+        RoutingMethodType.MiniMax2,
+    )
+    return not sigmoid_bias or top_k <= _SM107_MOE_PDL_SIGMOID_BIAS_MAX_TOP_K
+
+
+@contextlib.contextmanager
+def _sm107_moe_pdl(
+    num_tokens: int,
+    num_experts: int,
+    hidden_size: int,
+    routing_method: RoutingMethodType,
+    n_group: int | None,
+    top_k: int,
+):
+    """Opt into PDL for one small trtllm-gen MoE call on SM107.
+
+    FlashInfer 0.6.18 (PR #4806) forces ``enable_pdl=False`` for the whole
+    trtllm-gen MoE pipeline on CC 10.7 after crashes in Cluster routing. With
+    routingCustom-family routing (no expert groups; top_k <= 22 for the
+    SigmoidBias policy), up to 16 tokens and <= 512 experts, routing runs the
+    Block/DynBlock kernels (not Cluster/Coop) and finalize runs finalizeKernel
+    (not finalizeKernelVecLoad); together with bmm FC1/FC2 they all wait on
+    their producer before reading it. Enabled by
+    VLLM_FI_SM107_MOE_PDL_MAX_TOKENS (default 0: FlashInfer behaviour).
+    """
+    if not (
+        _sm107_moe_pdl_allowed(
+            num_tokens, num_experts, hidden_size, routing_method, n_group, top_k
+        )
+        and current_platform.is_device_capability(107)
+    ):
+        yield
+        return
+    import flashinfer.fused_moe.core as fi_moe_core
+    from flashinfer.utils import device_support_pdl
+
+    gate = fi_moe_core._device_support_moe_pdl
+    fi_moe_core._device_support_moe_pdl = device_support_pdl
+    try:
+        yield
+    finally:
+        fi_moe_core._device_support_moe_pdl = gate
 
 
 def prepare_deepseek_fp8_x_sf(x: torch.Tensor, x_sf: torch.Tensor) -> torch.Tensor:
@@ -504,7 +594,15 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         )
         if is_mxfp8 or activation == MoEActivation.RELU2_NO_MUL:
             kwargs["activation_type"] = activation_type
-        result = flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
+        with _sm107_moe_pdl(
+            hidden_states.shape[0],
+            global_num_experts,
+            hidden_states.shape[-1],
+            self.routing_method_type,
+            n_group,
+            self.topk,
+        ):
+            result = flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
         self._maybe_dispatch_routing_replay(
             routing_replay_out, num_tokens=hidden_states.shape[0]
         )
