@@ -295,6 +295,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
+    VLLM_FI_SM107_MOE_PDL_MAX_TOKENS: int = 0
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
@@ -2017,6 +2018,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TODO(alexm-redhat): Tune to be more dynamic based on GPU type
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
+    ),
+    # SM107 only: launch the FlashInfer trtllm-gen MoE pipeline with PDL for
+    # calls of at most this many tokens (clamped to 16; 0 = FlashInfer default,
+    # which disables MoE PDL on SM107). Applies only to routingCustom-family
+    # routing (no expert groups; top_k <= 22 for DeepSeekV3 / MiniMax2), where
+    # up to 16 tokens the pipeline runs Block/DynBlock routing, bmm FC1/FC2 and
+    # finalizeKernel, which all wait on their producer before reading it.
+    "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS": lambda: min(
+        int(os.getenv("VLLM_FI_SM107_MOE_PDL_MAX_TOKENS", "0")), 16
     ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
