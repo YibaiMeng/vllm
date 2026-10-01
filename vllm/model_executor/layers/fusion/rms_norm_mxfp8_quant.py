@@ -16,6 +16,7 @@ MoE input), and gates the second summand like the Qwen shared expert:
 
 import torch
 
+from vllm.model_executor.layers.fusion.mxfp8_pdl import mxfp8_producer_early_trigger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -94,6 +95,7 @@ def _add_rms_norm_mxfp8_kernel(
     STORE_NORMED: tl.constexpr,
     STORE_LINEAR_SF: tl.constexpr,
     LAUNCH_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
@@ -102,6 +104,10 @@ def _add_rms_norm_mxfp8_kernel(
     NUM_GROUPS: tl.constexpr = HIDDEN // 32
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
+        if EARLY_TRIGGER:
+            # The consumer (MXFP8 GEMM) waits on this grid before reading, so
+            # let it launch and run its prologue while this one works.
+            tl.extra.cuda.gdc_launch_dependents()
     if row < num_tokens:
         x = tl.load(x_ptr + row * x_stride + cols, mask=mask, other=0.0)
         x = x.to(tl.float32)
@@ -248,6 +254,7 @@ def add_rms_norm_mxfp8_quant(
             STORE_NORMED=store_normed,
             STORE_LINEAR_SF=store_linear_scales,
             LAUNCH_PDL=launch_pdl,
+            EARLY_TRIGGER=launch_pdl and mxfp8_producer_early_trigger(),
             launch_pdl=launch_pdl,
             num_warps=num_warps,
         )
