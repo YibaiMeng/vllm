@@ -336,7 +336,8 @@ _SOURCE = r"""// Fused MoE router GEMV + top-K softmax routing + TRT-LLM routing
 //   rows of an expert in token order. num_tokens_per_expert is written as well; the histogram scratch and
 //   the padding rows of permuted_idx_to_token_idx are left untouched.
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -684,7 +685,7 @@ void run(torch::Tensor x, torch::Tensor w, torch::Tensor logits, torch::Tensor w
   cfg.gridDim = dim3(kE / 16, (tiles + kTilesPerCta - 1) / kTilesPerCta);
   cfg.blockDim = dim3(kThreads);
   cfg.dynamicSmemBytes = kSmemBytes;
-  cfg.stream = at::cuda::getCurrentCUDAStream();
+  cfg.stream = c10::cuda::getCurrentCUDAStream();
   cudaLaunchAttribute attr[1];
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr[0].val.programmaticStreamSerializationAllowed = 1;
