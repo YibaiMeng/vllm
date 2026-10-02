@@ -126,6 +126,15 @@ def _bf16_ulp_diff(a: torch.Tensor, b: torch.Tensor) -> int:
     return int((ordered(a) - ordered(b)).abs().max())
 
 
+def _assert_logits_close(logits: torch.Tensor, x: torch.Tensor, w: torch.Tensor):
+    """fp32 accumulation + one bf16 rounding: within half a bf16 step (2^-9 relative)
+    of the exact result, plus the fp32 accumulation error (absolute).
+    """
+    exact = x.double() @ w.double().t()
+    err = (logits.double() - exact).abs()
+    assert bool((err <= exact.abs() * 2**-8 + 2**-12).all())
+
+
 def _inputs(m: int, seed: int):
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(m, K, device="cuda", dtype=torch.float32, generator=g)
@@ -180,9 +189,7 @@ def test_matches_flashinfer_semantics(m: int, tile_n: int):
     out.permuted_idx_to_token_idx.fill_(-7)
     out.expert_count_histogram.fill_(-9)
     view, logits = _run(x, w, 8, tile_n, out=out)
-    # fp32 accumulation of the exact products: within one bf16 step of the fp64 result.
-    exact = (x.double() @ w.double().t()).to(torch.bfloat16)
-    assert _bf16_ulp_diff(logits, exact) <= 1
+    _assert_logits_close(logits, x, w)
     _check_against_reference(view, logits, 8, tile_n)
     # Left untouched, as by FlashInfer: histogram scratch and padding rows.
     assert bool((out.expert_count_histogram == -9).all())
@@ -272,8 +279,7 @@ def test_cuda_graph_replay(use_pdl: bool):
         torch.accelerator.synchronize()
         assert int(out.workspace[0]) == 0
         for w, lg, snap in zip(weights, logits, snaps):
-            exact = (x.double() @ w.double().t()).to(torch.bfloat16)
-            assert _bf16_ulp_diff(lg, exact) <= 1
+            _assert_logits_close(lg, x, w)
             ref = _reference(lg, top_k, tile_n)
             assert torch.equal(snap[3].cpu(), ref["weights"].cpu())
             assert torch.equal(snap[1].cpu(), ref["exp_to_perm"])
