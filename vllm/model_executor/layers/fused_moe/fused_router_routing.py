@@ -270,6 +270,7 @@ def fused_router_routing(
     logits_out: torch.Tensor | None = None,
     tiles_per_cta: int | None = None,
     early_trigger: bool | None = None,
+    weight_prefetch: bool | None = None,
     timing_out: torch.Tensor | None = None,
 ) -> None:
     """Router logits ``bf16(x @ weight.T)`` + top-K softmax routing + metadata.
@@ -283,6 +284,8 @@ def fused_router_routing(
     ``tiles_per_cta`` (1, 2 or 4 eight-token tiles per CTA) overrides the default
     launch shape; ``early_trigger`` (PDL only) overrides when dependents are
     triggered: when the routing CTA starts (True) or after its last write (False);
+    ``weight_prefetch`` overrides whether the router rows are requested before
+    ``griddepcontrol.wait`` (True) or after it;
     ``timing_out`` (int64, >= 8 per CTA) receives per-CTA
     %globaltimer phase stamps (profiling only).
     """
@@ -331,6 +334,7 @@ def fused_router_routing(
         use_pdl,
         tiles_per_cta or _default_tiles_per_cta(num_tokens),
         EARLY_TRIGGER if early_trigger is None else early_trigger,
+        WEIGHT_PREFETCH if weight_prefetch is None else weight_prefetch,
         _NO_TIMING if timing_out is None else timing_out,
     )
 
@@ -339,6 +343,8 @@ _NO_TIMING = torch.empty(0, dtype=torch.int64)
 # Under PDL, trigger the dependents (FlashInfer's FC1) when the routing CTA starts
 # (VR microbench: -1.9 to -2.2 us per call vs triggering after the last write).
 EARLY_TRIGGER = True
+# Request the (constant) router rows before griddepcontrol.wait.
+WEIGHT_PREFETCH = True
 
 
 def _default_tiles_per_cta(num_tokens: int) -> int:
@@ -408,6 +414,7 @@ struct Params {
   int M, topK, tileLog2;
   bool usePdl;
   bool earlyTrigger;  // PDL: trigger dependents when the routing CTA starts (else after its last write)
+  bool prefetchW;     // request the router rows before griddepcontrol.wait (else after it)
 };
 
 __device__ __forceinline__ float add_ftz(float a, float b) {
@@ -461,8 +468,8 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
   const uint32_t sX = sW + kSmemW;
   stamp(p, 0);
 
-  // 1. Router rows -> smem (constant data: requested before the PDL wait).
-  {
+  // 1. Router rows -> smem (constant data: by default requested before the PDL wait).
+  auto loadW = [&]() {
     const char* src = reinterpret_cast<const char*>(p.w + static_cast<int64_t>(ftile) * 16 * kK);
 #pragma unroll
     for (int i = 0; i < 16 * kChunks / kThreads; i++) {
@@ -471,8 +478,10 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
       cp_async16(sW + swz(r, c), src + static_cast<int64_t>(r) * kRowBytes + c * 16, 16);
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
-  }
+  };
+  if (p.prefetchW) loadW();
   if (p.usePdl) asm volatile("griddepcontrol.wait;" ::: "memory");
+  if (!p.prefetchW) loadW();
   // 2. Token rows -> smem (rows past M are zero-filled).
 #pragma unroll
   for (int i = 0; i < TPC * 8 * kChunks / kThreads; i++) {
@@ -737,7 +746,7 @@ static void launch(const Params& p, int device, cudaStream_t stream) {
 void run(torch::Tensor x, torch::Tensor w, torch::Tensor logits, torch::Tensor workspace, torch::Tensor totalPadded,
          torch::Tensor expToPerm, torch::Tensor permToTok, torch::Tensor weights, torch::Tensor tokPerExpert,
          torch::Tensor ctaBatch, torch::Tensor ctaMn, torch::Tensor numCtas, int64_t topK, int64_t tileN, bool usePdl,
-         int64_t tilesPerCta, bool earlyTrigger, torch::Tensor timing) {
+         int64_t tilesPerCta, bool earlyTrigger, bool prefetchW, torch::Tensor timing) {
   const int64_t M = x.size(0);
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16 &&
               logits.scalar_type() == at::kBFloat16 && weights.scalar_type() == at::kBFloat16);
@@ -777,6 +786,7 @@ void run(torch::Tensor x, torch::Tensor w, torch::Tensor logits, torch::Tensor w
   while ((int64_t{1} << p.tileLog2) < tileN) p.tileLog2++;
   p.usePdl = usePdl;
   p.earlyTrigger = earlyTrigger;
+  p.prefetchW = prefetchW;
 
   const c10::cuda::CUDAGuard guard(x.device());
   const int dev = x.device().index();
