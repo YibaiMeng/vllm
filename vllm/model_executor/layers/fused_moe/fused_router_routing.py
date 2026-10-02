@@ -244,8 +244,8 @@ def load():
             sources=[src],
             # No fast-math, no FMA contraction: the routing math is explicit PTX
             # mirroring FlashInfer's fast-math build.
-            extra_cuda_cflags=["-O3", "-std=c++17", "-lineinfo", "-fmad=false"],
-            extra_cflags=["-O3", "-std=c++17"],
+            extra_cuda_cflags=["-O3", "-std=c++20", "-lineinfo", "-fmad=false"],
+            extra_cflags=["-O3", "-std=c++20"],
             build_directory=build,
             verbose=False,
         )
