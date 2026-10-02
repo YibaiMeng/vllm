@@ -184,13 +184,19 @@ def _gdn_fi_non_cp_max_tokens() -> int:
 
 
 def _gdn_vsplit_warmup(
-    num_k_heads: int, num_v_heads: int, head_dim: int, dtype: torch.dtype, device
+    num_k_heads: int,
+    num_v_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    state_dtype: torch.dtype,
+    device,
 ) -> None:
-    """Compile the V-split kernel for the one variant serving uses (fp32 pool
-    with int32 state_indices, initial and final state) on a dummy pool and
-    enable it; once per process. cute.compile keeps no on-disk cache: without
-    this, the first eligible prefill of each worker would stall for seconds on
-    the compile. A failed compile leaves FlashInfer's kernel in place.
+    """Compile the V-split kernel for the one variant serving uses (pool of
+    ``state_dtype``, fp32 or bf16, with int32 state_indices, initial and final
+    state) on a dummy pool and enable it; once per process. cute.compile keeps
+    no on-disk cache: without this, the first eligible prefill of each worker
+    would stall for seconds on the compile. A failed compile leaves
+    FlashInfer's kernel in place.
 
     The stock FlashInfer non-CP kernel still runs the steps choose_vsplit
     leaves at v_split=1 (some 4-6 sequence batches). Without V-split, the
@@ -208,7 +214,7 @@ def _gdn_vsplit_warmup(
         v = torch.zeros(T, num_v_heads, head_dim, device=device, dtype=dtype)
         gate = torch.ones(T, num_v_heads, device=device, dtype=torch.float32)
         pool = torch.zeros(
-            2, num_v_heads, head_dim, head_dim, device=device, dtype=torch.float32
+            2, num_v_heads, head_dim, head_dim, device=device, dtype=state_dtype
         )
         gdn_vsplit.chunk_gated_delta_rule_vsplit(
             q,
@@ -248,7 +254,10 @@ def _gdn_vsplit_warmup(
         )
         return
     _gdn_vsplit_ready.append(gdn_vsplit)
-    logger.info("GDN prefill: V-split FlashInfer kernel compiled and enabled.")
+    logger.info(
+        "GDN prefill: V-split FlashInfer kernel compiled and enabled (%s state).",
+        str(state_dtype).removeprefix("torch."),
+    )
 
 
 def _consumes_swizzled_mxfp8(linear: nn.Module) -> bool:
@@ -389,7 +398,8 @@ def fi_chunk_gated_delta_rule(
     ``output_g_exp=True``). ``output``: contiguous buffer with ``v.numel()``
     elements that FlashInfer writes into instead of allocating.
     ``state_indices``: contiguous int32 slot ids; ``initial_state`` is then the
-    fp32 SSM state pool, read from and updated in place at those rows (SM10x).
+    SSM state pool (fp32 or bf16), read from and updated in place at those
+    rows (SM10x).
     ``max_seqlen`` (longest sequence, host int) and ``cu_seqlens_i32`` (int32
     copy of ``cu_seqlens``) feed the V-split path; both are optional.
     """
@@ -425,7 +435,7 @@ def fi_chunk_gated_delta_rule(
         and state_indices is not None
         and g_is_exp
         and output_final_state
-        and fi_state.dtype == torch.float32
+        and fi_state.dtype in (torch.float32, torch.bfloat16)
     ):
         gdn_vsplit = _gdn_vsplit_ready[0]
         v_split = gdn_vsplit.choose_vsplit(
@@ -506,12 +516,15 @@ class ChunkGatedDeltaRule(CustomOp):
 
     def updates_state_in_place(self, state_dtype: torch.dtype) -> bool:
         """Whether prefill reads and writes the SSM state pool in place
-        (FlashInfer ``state_indices``, SM10x, fp32 pool).
+        (FlashInfer ``state_indices``, SM10x, fp32 or bf16 pool). FlashInfer's
+        SM100 kernels (non-CP and CP) load a bf16 pool row into fp32, compute
+        in fp32 and store the final state rounded to nearest even, as the
+        gather path's ``last_state.to(ssm_state.dtype)`` does.
         """
         return (
             self.gdn_prefill_backend == "flashinfer"
             and current_platform.is_device_capability_family(100)
-            and state_dtype == torch.float32
+            and state_dtype in (torch.float32, torch.bfloat16)
         )
 
     def forward_cuda(
@@ -1535,7 +1548,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.head_k_dim == 128
             and self.head_v_dim == 128
         ):
-            _gdn_vsplit_warmup(num_k_heads, num_v_heads, self.head_k_dim, dtype, device)
+            _gdn_vsplit_warmup(
+                num_k_heads, num_v_heads, self.head_k_dim, dtype, state_dtype, device
+            )
         if (
             GDN_MTP_CUDA_JIT
             and self.gdn_decode_kernel == "cuda"
