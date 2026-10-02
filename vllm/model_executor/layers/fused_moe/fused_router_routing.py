@@ -30,13 +30,16 @@ Numerics (see the module's CUDA source header for the instruction-level detail):
   sum, ``div.approx.ftz`` and a bf16 round. Within-expert rows are in token order, as
   in FlashInfer's block / dynamic-block kernels.
 
-The kernel: 16 feature tiles x ceil(M / 32) token groups of 512-thread CTAs. Each CTA
-streams its 16 router rows into shared memory with ``cp.async`` *before*
-``griddepcontrol.wait`` (the weight is constant), then loads its tokens, runs the
-four mma chains per 8-token tile, combines them and stores bf16 logits. The last CTA
-to arrive (self-resetting arrival counter in ``FusedRoutingOutputs.workspace``) does
-the routing for all tokens. Under PDL every global write and every read of ``x`` is
-after the wait, and dependents are triggered after the last write.
+The kernel: 16 expert tiles x ceil(M / 8) token tiles of 512-thread CTAs (one 8-token
+tile per CTA by default). Each CTA streams its 16 router rows into shared memory with
+``cp.async`` *before* ``griddepcontrol.wait`` (the weight is constant), then its token
+rows, runs the four mma chains of its tile, combines them in shared memory and stores
+bf16 logits. The last CTA to arrive (self-resetting arrival counter in
+``FusedRoutingOutputs.workspace``) does top-K, softmax and the metadata for all tokens,
+one warp per token. Under PDL every global write and every read of ``x`` is after the
+wait; dependents are triggered when the routing CTA starts (``EARLY_TRIGGER``; FC1
+waits for this grid's completion before reading routing, so only its launch and
+pre-wait prologue overlap the routing) or, if disabled, after the last write.
 
 The CUDA source is kept in this module (``_SOURCE``); ``load()`` writes it into the
 build directory under VLLM_CACHE_ROOT and builds it with torch.utils.cpp_extension
@@ -333,8 +336,9 @@ def fused_router_routing(
 
 
 _NO_TIMING = torch.empty(0, dtype=torch.int64)
-# Under PDL, trigger the dependents (FlashInfer's FC1) when the routing CTA starts.
-EARLY_TRIGGER = False
+# Under PDL, trigger the dependents (FlashInfer's FC1) when the routing CTA starts
+# (VR microbench: -1.9 to -2.2 us per call vs triggering after the last write).
+EARLY_TRIGGER = True
 
 
 def _default_tiles_per_cta(num_tokens: int) -> int:
