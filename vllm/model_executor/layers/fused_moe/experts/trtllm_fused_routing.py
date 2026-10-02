@@ -176,9 +176,12 @@ def _new_state(device: torch.device, num_experts: int) -> _State:
 
 
 def _fallback(reason: str) -> None:
+    # Expected (harmless) cases: vLLM's CUDA-graph memory-profiling capture
+    # runs before kernel warmup prepares the buffers and before autotuning.
     logger.warning_once(
-        "Fused MoE router + routing: %s; using the router GEMM + FlashInfer "
-        "routing for this call.",
+        "Fused MoE router + routing: %s; this call runs the router GEMM + "
+        "FlashInfer routing (expected during the CUDA-graph memory profiling "
+        "that precedes kernel warmup).",
         reason,
     )
 
@@ -206,6 +209,7 @@ def _plan(
     activation_type: int,
     deferred: bool,
     use_pdl: bool,
+    quiet: bool = False,
 ) -> _Call | None:
     """Resolve the stock call's tactic and the prepared buffers for it,
     creating them unless capturing. None: the call takes the stock path.
@@ -286,7 +290,8 @@ def _plan(
     # A cached tactic is a [tile_n, config] sequence (list, tuple or FFI
     # array); -1 means no tuned entry (the stock call's fallback heuristic).
     if isinstance(tactic, int) or len(tactic) != 2:
-        _fallback(f"no autotuned tactic for {num_tokens} tokens")
+        if not quiet:
+            _fallback(f"no autotuned tactic for {num_tokens} tokens")
         return None
     tile_n, config = int(tactic[0]), int(tactic[1])
     kernel = _kernel_module()
@@ -349,13 +354,18 @@ def _plan(
 
 
 def prepare_fused_router_routing(
-    experts: Any, w1: torch.Tensor, w2: torch.Tensor, *, activation_type: int
+    experts: Any,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    activation_type: int,
+    deferred: bool,
 ) -> None:
     """Create the buffers and DA bodies of every token count the fused path
-    serves, for the tactics the autotuner chose. vLLM captures its decode
-    CUDA graphs without eager warmup runs, so this runs before capture
-    (kernel_warmup, after FlashInfer autotuning); layers of one shape share
-    them, so repeated calls are cheap.
+    serves, for the tactics the autotuner chose, in the layer's finalize mode
+    (``deferred``). vLLM captures its decode CUDA graphs without eager warmup
+    runs, so this runs before capture (kernel_warmup, after FlashInfer
+    autotuning); layers of one shape share them, so repeated calls are cheap.
     """
     if torch.cuda.is_current_stream_capturing():
         return
@@ -368,20 +378,30 @@ def prepare_fused_router_routing(
         max_tokens, hidden, dtype=torch.float8_e4m3fn, device=w1.device
     )
     scales = torch.zeros(max_tokens, hidden // 32, dtype=torch.uint8, device=w1.device)
-    # Both finalize modes: the deferred finalize is switched on by the first
-    # run of the deferring op, which need not have happened yet.
-    for num_tokens in range(1, max_tokens + 1):
-        for deferred in (True, False):
-            _plan(
-                experts,
-                hidden_states[:num_tokens],
-                scales[:num_tokens],
-                w1,
-                w2,
-                activation_type=activation_type,
-                deferred=deferred,
-                use_pdl=False,
-            )
+    untuned = [
+        num_tokens
+        for num_tokens in range(1, max_tokens + 1)
+        if _plan(
+            experts,
+            hidden_states[:num_tokens],
+            scales[:num_tokens],
+            w1,
+            w2,
+            activation_type=activation_type,
+            deferred=deferred,
+            use_pdl=False,
+            quiet=True,
+        )
+        is None
+    ]
+    log = logger.warning_once if untuned else logger.info_once
+    log(
+        "Fused MoE router + routing prepared for 1-%d tokens (%s finalize); "
+        "without an autotuned tactic (these keep the stock path): %s.",
+        max_tokens,
+        "deferred" if deferred else "FlashInfer",
+        ",".join(map(str, untuned)) or "none",
+    )
 
 
 def run_fused_router_routing(

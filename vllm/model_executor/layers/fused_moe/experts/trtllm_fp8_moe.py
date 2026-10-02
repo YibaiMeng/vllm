@@ -483,15 +483,19 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             )
         )
 
-    def prepare_fused_router_routing(self, w1: torch.Tensor, w2: torch.Tensor) -> None:
+    def prepare_fused_router_routing(
+        self, w1: torch.Tensor, w2: torch.Tensor, *, deferred: bool
+    ) -> None:
         """Create the fused router + routing buffers before CUDA-graph capture
-        (call only when ``supports_fused_router_routing`` holds).
+        (call only when ``supports_fused_router_routing`` holds); ``deferred``:
+        the layer's calls stop after FC2 (deferred finalize).
         """
         prepare_fused_router_routing(
             self,
             w1,
             w2,
             activation_type=activation_to_flashinfer_int(self.moe_config.activation),
+            deferred=deferred,
         )
 
     def __init__(

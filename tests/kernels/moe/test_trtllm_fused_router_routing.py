@@ -361,7 +361,7 @@ def test_prepared_capture_without_eager_call(
     experts, w1, w2, gate = _make_experts(device, seed=5)
     forced_tactic["tactic"] = _tactics(experts, 16, device)[0]
     trtllm_fused_routing._STATES.clear()
-    experts.prepare_fused_router_routing(w1, w2)
+    experts.prepare_fused_router_routing(w1, w2, deferred=True)
     for m in (1, 7, 16):
         x, xq, xs = _inputs(m, device, seed=20 + m)
         fused_launches.clear()

@@ -1319,8 +1319,12 @@ class MoERunner(MoERunnerInterface):
             kernel = self._quant_method.moe_kernel
             assert kernel is not None
             experts = cast(Any, kernel.fused_experts)  # TrtLlmFp8ExpertsMonolithic
+            # The layer's finalize mode in serving: deferred when its op is
+            # the deferring one (DLC-8), else FlashInfer finalizes.
             experts.prepare_fused_router_routing(
-                self.routed_experts.w13_weight, self.routed_experts.w2_weight
+                self.routed_experts.w13_weight,
+                self.routed_experts.w2_weight,
+                deferred=self._routed_finalize_deferred(),
             )
 
     def _forward_impl(
