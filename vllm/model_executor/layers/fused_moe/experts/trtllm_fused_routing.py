@@ -283,7 +283,9 @@ def _plan(
     _, tactic = tuner.choose_one(
         "flashinfer::trtllm_fp8_block_scale_moe", [moe_runner], tuning_config, inputs
     )
-    if not isinstance(tactic, (list, tuple)) or len(tactic) != 2:
+    # A cached tactic is a [tile_n, config] sequence (list, tuple or FFI
+    # array); -1 means no tuned entry (the stock call's fallback heuristic).
+    if isinstance(tactic, int) or len(tactic) != 2:
         _fallback(f"no autotuned tactic for {num_tokens} tokens")
         return None
     tile_n, config = int(tactic[0]), int(tactic[1])

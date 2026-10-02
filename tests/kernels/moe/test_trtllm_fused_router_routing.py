@@ -418,3 +418,23 @@ def test_unsupported_layers_are_not_offered_the_fused_path(monkeypatch):
 
     monkeypatch.setenv("VLLM_MOE_FUSED_ROUTING_MAX_TOKENS", "0")
     assert not experts.supports_fused_router_routing(gate)
+
+
+@gpu
+def test_uses_the_autotuned_tactic_of_the_stock_call(fused_launches):
+    """With a real autotuner cache (as after vLLM's warmup tuning) the fused
+    path finds the stock call's tuned entry and matches it bitwise.
+    """
+    import flashinfer
+
+    device = torch.device("cuda")
+    experts, w1, w2, gate = _make_experts(device, seed=6)
+    m = 8
+    x, xq, xs = _inputs(m, device, seed=31)
+    with flashinfer.autotune(True):
+        _apply(experts, w1, w2, xq, xs, gate(x)[0])
+    ref = _apply(experts, w1, w2, xq, xs, gate(x)[0])
+    got = _apply(experts, w1, w2, xq, xs, FusedRouterInput(x, gate))
+    assert fused_launches == [m]
+    torch.accelerator.synchronize()
+    assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
