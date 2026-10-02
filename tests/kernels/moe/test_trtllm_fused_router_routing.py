@@ -438,3 +438,45 @@ def test_uses_the_autotuned_tactic_of_the_stock_call(fused_launches):
     assert fused_launches == [m]
     torch.accelerator.synchronize()
     assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+
+
+@gpu
+@pytest.mark.parametrize("fused_pdl", ["0", "1", None])
+def test_fused_kernel_pdl_follows_its_own_knob(monkeypatch, forced_tactic, fused_pdl):
+    """VLLM_MOE_FUSED_ROUTING_PDL (default off) decides only the fused kernel's
+    PDL launch; FC1/FC2 keep the stock call's PDL decision.
+    """
+    from vllm.model_executor.layers.fused_moe import fused_router_routing as frr
+
+    if fused_pdl is None:
+        monkeypatch.delenv("VLLM_MOE_FUSED_ROUTING_PDL", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_MOE_FUSED_ROUTING_PDL", fused_pdl)
+    kernel_pdl: list[bool] = []
+    body_pdl: list[bool] = []
+    orig_kernel = frr.fused_router_routing
+    orig_plan = trtllm_fused_routing._plan
+
+    def kernel_spy(*args, **kwargs):
+        kernel_pdl.append(kwargs["use_pdl"])
+        return orig_kernel(*args, **kwargs)
+
+    def plan_spy(*args, **kwargs):
+        call = orig_plan(*args, **kwargs)
+        if call is not None:
+            body_pdl.append(call.runner_kwargs["enable_pdl"])
+        return call
+
+    monkeypatch.setattr(frr, "fused_router_routing", kernel_spy)
+    monkeypatch.setattr(trtllm_fused_routing, "_plan", plan_spy)
+    device = torch.device("cuda")
+    experts, w1, w2, gate = _make_experts(device, seed=8)
+    m = 8
+    forced_tactic["tactic"] = _tactics(experts, m, device)[0]
+    x, xq, xs = _inputs(m, device, seed=41)
+    got = _apply(experts, w1, w2, xq, xs, FusedRouterInput(x, gate))
+    ref = _apply(experts, w1, w2, xq, xs, gate(x)[0])
+    assert kernel_pdl == [fused_pdl == "1"]
+    assert body_pdl == [True]  # VLLM_FI_SM107_MOE_PDL_MAX_TOKENS=1024
+    torch.accelerator.synchronize()
+    assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])

@@ -398,8 +398,13 @@ def run_fused_router_routing(
 ) -> torch.Tensor | UnfinalizedMoEOutput | None:
     """Run one MXFP8 trtllm-gen MoE call as fused router/routing kernel +
     FlashInfer DA body. ``experts`` is the TrtLlmFp8ExpertsMonolithic that
-    accepted ``router`` (static qualification done). Returns None when this
-    call must take the stock path (the caller then computes the logits).
+    accepted ``router`` (static qualification done). ``use_pdl`` is the stock
+    call's PDL decision and applies to the body (FC1/FC2). The fused kernel
+    itself is a PDL launch (waiting on its producer, early trigger) only with
+    VLLM_MOE_FUSED_ROUTING_PDL=1; otherwise it is a plain launch that completes
+    before FC1 starts, as the stock routing kernel does before FC1 under the
+    soaked PDL chain. Returns None when this call must take the stock path
+    (the caller then computes the logits).
     """
     call = _plan(
         experts,
@@ -423,7 +428,7 @@ def run_fused_router_routing(
         top_k=top_k,
         tile_n=call.body.tile_n,
         renormalize_mode=int(experts.routing_method_type),
-        use_pdl=use_pdl,
+        use_pdl=use_pdl and envs.VLLM_MOE_FUSED_ROUTING_PDL,
     )
     call.body_runner.forward_from_metadata(
         call.inputs, call.body, call.slot, workspace, **call.runner_kwargs

@@ -305,6 +305,7 @@ if TYPE_CHECKING:
     VLLM_MTP_DRAFT_LM_HEAD_MXFP8: bool = False
     VLLM_FI_SM107_MOE_PDL_MAX_TOKENS: int = 0
     VLLM_MOE_FUSED_ROUTING_MAX_TOKENS: int = 0
+    VLLM_MOE_FUSED_ROUTING_PDL: bool = False
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
@@ -2094,6 +2095,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MoE body. Needs the GS2_ROUTE patched FlashInfer module.
     "VLLM_MOE_FUSED_ROUTING_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_MOE_FUSED_ROUTING_MAX_TOKENS", "0")
+    ),
+    # With VLLM_MOE_FUSED_ROUTING_MAX_TOKENS: 1 launches the fused router +
+    # routing kernel with PDL (waits on its producer, triggers FC1 early).
+    # 0 (default): plain launch; FC1/FC2 keep their PDL setting from
+    # VLLM_FI_SM107_MOE_PDL_MAX_TOKENS.
+    "VLLM_MOE_FUSED_ROUTING_PDL": lambda: bool(
+        int(os.getenv("VLLM_MOE_FUSED_ROUTING_PDL", "0"))
     ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
