@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fusion.moe_finalize  # noqa: F401
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
@@ -25,6 +26,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
+)
+from vllm.model_executor.layers.fused_moe.experts.trtllm_fused_routing import (
+    FusedRouterInput,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
@@ -489,6 +493,9 @@ class MoERunner(MoERunnerInterface):
         # in a single launch.
         self._fse_fuse_gate = gate is not None and shared_expert_gate is not None
         self._combined_gate_weight: torch.Tensor | None = None
+        # Lazily resolved: whether this layer may run the fused router +
+        # routing path (needs the quant method's kernel).
+        self._fused_router_routing_layer: bool | None = None
 
         # The shared expert's sigmoid gate is applied after the MoE op, where
         # the compiled graph fuses it into the next layer's add + RMSNorm.
@@ -1259,6 +1266,67 @@ class MoERunner(MoERunnerInterface):
             )
         return shared_q, routed_q
 
+    def _fused_router_routing_applies(self, hidden_states: torch.Tensor) -> bool:
+        """Whether this call skips the router GEMM and hands the routed experts
+        a FusedRouterInput (VLLM_MOE_FUSED_ROUTING_MAX_TOKENS; see
+        experts/trtllm_fused_routing.py). The experts may still fall back to
+        the logits for a call, via FusedRouterInput.logits().
+        """
+        if not (
+            0 < hidden_states.shape[0] <= envs.VLLM_MOE_FUSED_ROUTING_MAX_TOKENS
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+        ):
+            return False
+        if self._fused_router_routing_layer is None:
+            self._fused_router_routing_layer = self._fused_router_routing_supported()
+        return self._fused_router_routing_layer
+
+    def _fused_router_routing_supported(self) -> bool:
+        if (
+            self.gate is None
+            or self._fse_fuse_gate
+            or self.do_naive_dispatch_combine
+            or self.moe_config.dp_size != 1
+            or self.moe_config.ep_size != 1
+            or self.moe_config.pcp_size != 1
+            or self.moe_config.is_sequence_parallel
+            or self.routed_input_transform is not None
+            or self.routed_scaling_factor != 1.0
+            or isinstance(self.router, ZeroExpertRouter)
+            or not self._quant_method.is_monolithic
+        ):
+            return False
+        kernel = getattr(self._quant_method, "moe_kernel", None)
+        return (
+            kernel is not None
+            and isinstance(
+                kernel.prepare_finalize, MoEPrepareAndFinalizeNoDPEPMonolithic
+            )
+            and kernel.fused_experts.supports_fused_router_routing(self.gate)
+        )
+
+    def prepare_fused_router_routing(self) -> None:
+        """Create the fused router + routing path's buffers for every token
+        count it serves, before CUDA-graph capture (kernel_warmup). No-op
+        when the knob is off or the layer does not qualify.
+        """
+        if envs.VLLM_MOE_FUSED_ROUTING_MAX_TOKENS <= 0:
+            return
+        if self._fused_router_routing_layer is None:
+            self._fused_router_routing_layer = self._fused_router_routing_supported()
+        if self._fused_router_routing_layer:
+            kernel = self._quant_method.moe_kernel
+            assert kernel is not None
+            experts = cast(Any, kernel.fused_experts)  # TrtLlmFp8ExpertsMonolithic
+            # The layer's finalize mode in serving: deferred when its op is
+            # the deferring one (DLC-8), else FlashInfer finalizes.
+            experts.prepare_fused_router_routing(
+                self.routed_experts.w13_weight,
+                self.routed_experts.w2_weight,
+                deferred=self._routed_finalize_deferred(),
+            )
+
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -1309,6 +1377,9 @@ class MoERunner(MoERunnerInterface):
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
+            elif self._fused_router_routing_applies(hidden_states):
+                # The routed experts compute the logits inside their routing.
+                router_logits = FusedRouterInput(hidden_states, self.gate)
             else:
                 router_logits, _ = self.gate(hidden_states)
 

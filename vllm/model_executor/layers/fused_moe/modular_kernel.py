@@ -985,6 +985,14 @@ class FusedMoEExpertsMonolithic(FusedMoEExperts):
         """
         return False
 
+    def supports_fused_router_routing(self, gate: torch.nn.Module) -> bool:
+        """Whether ``apply`` may receive a ``FusedRouterInput`` (the router
+        input and ``gate``) instead of router logits for calls of at most
+        ``VLLM_MOE_FUSED_ROUTING_MAX_TOKENS`` tokens, computing the router
+        logits inside its routing (``experts/trtllm_fused_routing.py``).
+        """
+        return False
+
     def set_capture_fn(
         self,
         capture_fn: Callable[[torch.Tensor], None] | None,
