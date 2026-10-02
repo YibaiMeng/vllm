@@ -265,6 +265,8 @@ def fused_router_routing(
     renormalize_mode: int,
     use_pdl: bool,
     logits_out: torch.Tensor | None = None,
+    tiles_per_cta: int | None = None,
+    timing_out: torch.Tensor | None = None,
 ) -> None:
     """Router logits ``bf16(x @ weight.T)`` + top-K softmax routing + metadata.
 
@@ -274,6 +276,9 @@ def fused_router_routing(
     (``out.for_tokens(M)`` views are fine); ``renormalize_mode``: FlashInfer
     RoutingMethodType value (Renormalize or RenormalizeNaive); ``logits_out``:
     optional bf16 [M, 256] contiguous that receives the router logits.
+    ``tiles_per_cta`` (1, 2 or 4 eight-token tiles per CTA) overrides the default
+    launch shape; ``timing_out`` (int64, >= 8 per CTA) receives per-CTA
+    %globaltimer phase stamps (profiling only).
     """
     num_tokens = x.shape[0]
     if num_tokens == 0:
@@ -318,7 +323,16 @@ def fused_router_routing(
         top_k,
         tile_n,
         use_pdl,
+        tiles_per_cta or _default_tiles_per_cta(num_tokens),
+        _NO_TIMING if timing_out is None else timing_out,
     )
+
+
+_NO_TIMING = torch.empty(0, dtype=torch.int64)
+
+
+def _default_tiles_per_cta(num_tokens: int) -> int:
+    return 1
 
 
 _SOURCE = r"""// Fused MoE router GEMV + top-K softmax routing + TRT-LLM routing metadata (E=256, K=2048, M<=64).
@@ -335,6 +349,12 @@ _SOURCE = r"""// Fused MoE router GEMV + top-K softmax routing + TRT-LLM routing
 //   ceil(cnt / tile), exclusive scans in expert order, CTA tables, mn limits, padded size, permutation with
 //   rows of an expert in token order. num_tokens_per_expert is written as well; the histogram scratch and
 //   the padding rows of permuted_idx_to_token_idx are left untouched.
+//
+// Grid (16 expert tiles, ceil(M / (8 * TPC))), 512 threads. A CTA stages its 16 router rows (64 KB) and its
+// 8*TPC token rows (32 KB per 8 tokens) in shared memory with cp.async (rows 128B-swizzled, ldmatrix
+// conflict-free); the router rows are requested before griddepcontrol.wait. Warp (w, j) runs chain w of
+// token tile j; the chains are combined in shared memory. The last CTA to arrive (arrival counter, reset by
+// that CTA) routes all tokens with one warp per token, reusing the shared memory.
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
@@ -349,14 +369,16 @@ constexpr int kE = 256;        // experts (= router rows)
 constexpr int kK = 2048;       // hidden size
 constexpr int kThreads = 512;  // 16 warps
 constexpr int kWarps = kThreads / 32;
-constexpr int kTilesPerCta = 4;  // 8-token tiles per CTA (4 chains x 4 tiles = 16 warps)
 constexpr int kMaxTokens = 64;
 constexpr int kMaxTopK = 8;
 constexpr int kSlices = kK / 64;  // k16 slices per chain
 constexpr int kRowBytes = kK * 2;
-constexpr int kSmemW = 16 * kRowBytes;                  // 16 router rows
-constexpr int kSmemRed = kWarps * 32 * 4 * 4;           // chain partials
-constexpr int kSmemBytes = kSmemW + kSmemRed;
+constexpr int kChunks = kK / 8;              // 16-byte chunks per row
+constexpr int kSmemW = 16 * kRowBytes;       // 16 router rows
+template <int TPC>
+constexpr int smem_bytes() {
+  return kSmemW + TPC * 8 * kRowBytes;
+}
 
 struct Params {
   const __nv_bfloat16* x;
@@ -372,6 +394,7 @@ struct Params {
   int32_t* ctaBatch;
   int32_t* ctaMn;
   int32_t* numCtas;
+  unsigned long long* timing;  // optional per-CTA phase timestamps (profiling), else nullptr
   int M, topK, tileLog2;
   bool usePdl;
 };
@@ -386,117 +409,122 @@ __device__ __forceinline__ uint32_t redux_max(uint32_t v) {
   asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(v));
   return r;
 }
-__device__ __forceinline__ uint32_t ld_cg_u32(const void* p) {
-  uint32_t r;
-  asm volatile("ld.global.cg.b32 %0, [%1];" : "=r"(r) : "l"(p));
-  return r;
-}
 // cub::Traits<bf16>::TwiddleIn / TwiddleOut
 __device__ __forceinline__ uint32_t twiddle_in(uint32_t b) { return (b & 0x8000u) ? (~b & 0xffffu) : (b | 0x8000u); }
 __device__ __forceinline__ uint32_t twiddle_out(uint32_t b) { return (b & 0x8000u) ? (b & 0x7fffu) : (~b & 0xffffu); }
-
 __device__ __forceinline__ int slice_k0(int s, int w) {
   return ((s >> 4) * 4 + w) * 256 + ((s >> 2) & 3) * 64 + (s & 3) * 16;
 }
+__device__ __forceinline__ uint32_t swz(int row, int chunk) {  // byte offset of (row, 16B chunk)
+  return static_cast<uint32_t>(row * kRowBytes + ((chunk ^ (row & 7)) << 4));
+}
+__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, uint32_t srcBytes) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(srcBytes) : "memory");
+}
+__device__ __forceinline__ void stamp(const Params& p, int slot) {
+  if (p.timing != nullptr && threadIdx.x == 0) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    p.timing[(blockIdx.y * gridDim.x + blockIdx.x) * 8 + slot] = t;
+  }
+}
 
-#define RFR_CAS(i, j)                       \
+#define RFR_CAS(K, i, j)                    \
   {                                         \
-    uint32_t hi_ = max(key[i], key[j]);     \
-    uint32_t lo_ = min(key[i], key[j]);     \
-    key[i] = hi_;                           \
-    key[j] = lo_;                           \
+    const uint32_t hi_ = max(K[i], K[j]);   \
+    const uint32_t lo_ = min(K[i], K[j]);   \
+    K[i] = hi_;                             \
+    K[j] = lo_;                             \
   }
 
+template <int TPC>
 __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const Params p) {
-  extern __shared__ __align__(128) char smem[];
-  char* sW = smem;
-  float4* sRed = reinterpret_cast<float4*>(smem + kSmemW);
+  extern __shared__ __align__(1024) char smem[];
   __shared__ int sLast;
-  __shared__ unsigned long long sMask[kE];
-  __shared__ int sTopE[kMaxTokens * kMaxTopK];
-  __shared__ int sOffP[kE];
-  __shared__ int sWarpTot[kWarps];
-
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
-  const int ftile = blockIdx.x;  // 16 experts
-  const uint32_t sWAddr = static_cast<uint32_t>(__cvta_generic_to_shared(sW));
+  const int ftile = blockIdx.x;                // 16 experts
+  const int tok0 = blockIdx.y * TPC * 8;       // first token of this CTA
+  const uint32_t sW = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  const uint32_t sX = sW + kSmemW;
+  stamp(p, 0);
 
-  // 1. Router rows -> smem (constant data: allowed before the PDL wait). Row r, 16-byte chunk c at
-  //    r * kRowBytes + (c ^ (r & 7)) * 16 (conflict-free ldmatrix).
+  // 1. Router rows -> smem (constant data: requested before the PDL wait).
   {
     const char* src = reinterpret_cast<const char*>(p.w + static_cast<int64_t>(ftile) * 16 * kK);
 #pragma unroll
-    for (int i = 0; i < (16 * kK / 8) / kThreads; i++) {
+    for (int i = 0; i < 16 * kChunks / kThreads; i++) {
       const int idx = i * kThreads + tid;
-      const int r = idx / (kK / 8);
-      const int c = idx % (kK / 8);
-      const uint32_t dst = sWAddr + r * kRowBytes + ((c ^ (r & 7)) << 4);
-      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src + static_cast<int64_t>(r) * kRowBytes + c * 16)
-                   : "memory");
+      const int r = idx / kChunks, c = idx % kChunks;
+      cp_async16(sW + swz(r, c), src + static_cast<int64_t>(r) * kRowBytes + c * 16, 16);
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
   }
   if (p.usePdl) asm volatile("griddepcontrol.wait;" ::: "memory");
-
-  // 2. Four fp32 mma chains per 8-token tile (warp = chain w, tile j).
-  const int w = warp & 3;
-  const int tile = blockIdx.y * kTilesPerCta + (warp >> 2);
-  const bool active = tile * 8 < p.M;
-  float acc[4] = {0.f, 0.f, 0.f, 0.f};
-  uint32_t bf[kSlices][2];
-  if (active) {
-    const int tok = tile * 8 + (lane >> 2);
-    const int q2 = (lane & 3) * 2;
-    if (tok < p.M) {
-      const __nv_bfloat16* xr = p.x + static_cast<int64_t>(tok) * p.sx;
+  // 2. Token rows -> smem (rows past M are zero-filled).
 #pragma unroll
-      for (int s = 0; s < kSlices; s++) {
-        const int k0 = slice_k0(s, w);
-        bf[s][0] = ld_cg_u32(xr + k0 + q2);
-        bf[s][1] = ld_cg_u32(xr + k0 + 8 + q2);
-      }
-    } else {
-#pragma unroll
-      for (int s = 0; s < kSlices; s++) bf[s][0] = bf[s][1] = 0u;
-    }
+  for (int i = 0; i < TPC * 8 * kChunks / kThreads; i++) {
+    const int idx = i * kThreads + tid;
+    const int r = idx / kChunks, c = idx % kChunks;
+    const int tok = tok0 + r;
+    const char* src = reinterpret_cast<const char*>(p.x + static_cast<int64_t>(tok < p.M ? tok : 0) * p.sx) + c * 16;
+    cp_async16(sX + swz(r, c), src, tok < p.M ? 16u : 0u);
   }
+  asm volatile("cp.async.commit_group;" ::: "memory");
   asm volatile("cp.async.wait_all;" ::: "memory");
   __syncthreads();
+  stamp(p, 1);
+
+  // 3. Chain w of token tile j (warp = 4 j + w).
+  const int w = warp & 3;
+  const int j = warp >> 2;
+  const bool active = j < TPC && tok0 + j * 8 < p.M;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
   if (active) {
-    const int row = (lane & 7) + ((lane >> 3) & 1) * 8;
-    const int chalf = lane >> 4;
-    const uint32_t rowAddr = sWAddr + row * kRowBytes;
+    const int arow = (lane & 7) + ((lane >> 3) & 1) * 8;
+    const int achunk = lane >> 4;
+    const int xrow = j * 8 + (lane & 7);
+    const int xchunk = lane >> 3;  // x4: slice s (k 0-7, 8-15), slice s+1 (k 0-7, 8-15)
 #pragma unroll
-    for (int s = 0; s < kSlices; s++) {
-      const int c = (slice_k0(s, w) >> 3) + chalf;
-      uint32_t a0, a1, a2, a3;
+    for (int s = 0; s < kSlices; s += 2) {
+      const int c0 = slice_k0(s, w) >> 3;
+      uint32_t b[4];
       asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                   : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-                   : "r"(rowAddr + ((c ^ (row & 7)) << 4))
+                   : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3])
+                   : "r"(sX + swz(xrow, c0 + xchunk))
                    : "memory");
-      asm volatile(
-          "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
-          "{%0, %1, %2, %3};\n"
-          : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
-          : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bf[s][0]), "r"(bf[s][1]));
+#pragma unroll
+      for (int h = 0; h < 2; h++) {
+        uint32_t a0, a1, a2, a3;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                     : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                     : "r"(sW + swz(arow, c0 + 2 * h + achunk))
+                     : "memory");
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+            "{%0, %1, %2, %3};\n"
+            : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b[2 * h]), "r"(b[2 * h + 1]));
+      }
     }
-    sRed[warp * 32 + lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
   }
+  __syncthreads();  // shared memory is reused below
+  float4* red = reinterpret_cast<float4*>(smem + kSmemW);
+  if (active && w != 0) red[warp * 32 + lane] = make_float4(acc[0], acc[1], acc[2], acc[3]);
   __syncthreads();
   if (active && w == 0) {
     float o[4] = {acc[0], acc[1], acc[2], acc[3]};
 #pragma unroll
     for (int c = 1; c < 4; c++) {
-      const float4 v = sRed[(warp + c) * 32 + lane];
+      const float4 v = red[(warp + c) * 32 + lane];
       o[0] = add_ftz(o[0], v.x);
       o[1] = add_ftz(o[1], v.y);
       o[2] = add_ftz(o[2], v.z);
       o[3] = add_ftz(o[3], v.w);
     }
     const int e = ftile * 16 + (lane >> 2);
-    const int t = tile * 8 + (lane & 3) * 2;
+    const int t = tok0 + j * 8 + (lane & 3) * 2;
 #pragma unroll
     for (int z = 0; z < 4; z++) {
       const int tz = t + (z & 1);
@@ -504,57 +532,85 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
       if (tz < p.M) p.logits[tz * kE + ez] = __float2bfloat16_rn(add_ftz(o[z], 0.0f));
     }
   }
+  stamp(p, 2);
 
-  // 3. Arrival: the last CTA routes every token.
-  __threadfence();
+  // 4. Arrival (CTA barrier, then one acq_rel atomic, as CUTLASS's semaphore): the last CTA routes
+  //    every token and resets the counter for the next launch.
   __syncthreads();
   if (tid == 0) {
-    const int prev = atomicAdd(p.counter, 1);
+    int prev;
+    asm volatile("atom.add.acq_rel.gpu.s32 %0, [%1], 1;" : "=r"(prev) : "l"(p.counter) : "memory");
     sLast = prev == static_cast<int>(gridDim.x * gridDim.y) - 1;
+    if (sLast) *p.counter = 0;
   }
   __syncthreads();
+  stamp(p, 3);
   if (!sLast) return;
-  __threadfence();
-  if (tid == 0) *p.counter = 0;  // self-reset for the next launch
-  if (tid < kE) sMask[tid] = 0ull;
-  __syncthreads();
-
-  // 4. Top-K + softmax, one warp per token; lane holds experts 8*lane .. 8*lane+7.
-  const int topK = p.topK;
-  for (int t = warp; t < p.M; t += kWarps) {
-    const char* row = reinterpret_cast<const char*>(p.logits + t * kE) + lane * 16;
-    uint32_t v[4];
-    asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3])
-                 : "l"(row));
-    uint32_t key[8];
+  unsigned long long* sMask = reinterpret_cast<unsigned long long*>(smem);  // [256] token bitmask per expert
+  int* sTopE = reinterpret_cast<int*>(smem + 2048);                        // [M * topK] expert per slot
+  int* sOffP = reinterpret_cast<int*>(smem + 4096);                        // [256] first row per expert
+  int* sWarpTot = reinterpret_cast<int*>(smem + 5120);                     // [16]
+  // 5. Top-K + softmax, one warp per token (a warp's up to 4 tokens interleaved for ILP); lane holds
+  //    experts 8*lane .. 8*lane+7 as sorted packed keys.
+  constexpr int kTokPerWarp = kMaxTokens / kWarps;
+  const int nq = (p.M - warp + kWarps - 1) / kWarps;  // tokens of this warp: warp + q * kWarps, q < nq
+  uint32_t key[kTokPerWarp][8];
+#pragma unroll
+  for (int q = 0; q < kTokPerWarp; q++) {
+    uint32_t v[4] = {0u, 0u, 0u, 0u};
+    if (q < nq) {
+      asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                   : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3])
+                   : "l"(reinterpret_cast<const char*>(p.logits + (warp + q * kWarps) * kE) + lane * 16));
+    }
 #pragma unroll
     for (int i = 0; i < 8; i++) {
       const uint32_t bits = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-      key[i] = (twiddle_in(bits) << 16) | static_cast<uint32_t>(65535 - (lane * 8 + i));
+      key[q][i] = (twiddle_in(bits) << 16) | static_cast<uint32_t>(65535 - (lane * 8 + i));
     }
-    RFR_CAS(0, 2) RFR_CAS(1, 3) RFR_CAS(4, 6) RFR_CAS(5, 7)
-    RFR_CAS(0, 4) RFR_CAS(1, 5) RFR_CAS(2, 6) RFR_CAS(3, 7)
-    RFR_CAS(0, 1) RFR_CAS(2, 3) RFR_CAS(4, 5) RFR_CAS(6, 7)
-    RFR_CAS(2, 4) RFR_CAS(3, 5)
-    RFR_CAS(1, 4) RFR_CAS(3, 6)
-    RFR_CAS(1, 2) RFR_CAS(3, 4) RFR_CAS(5, 6)
-    uint32_t mine = 0u;
+  }
+  if (tid < kE) sMask[tid] = 0ull;
+  __syncthreads();
+
+  const int topK = p.topK;
 #pragma unroll
-    for (int kk = 0; kk < kMaxTopK; kk++) {
-      if (kk < topK) {
-        const uint32_t m = redux_max(key[0]);
-        if (key[0] == m) {
+  for (int q = 0; q < kTokPerWarp; q++) {
+    if (q < nq) {
+      RFR_CAS(key[q], 0, 2) RFR_CAS(key[q], 1, 3) RFR_CAS(key[q], 4, 6) RFR_CAS(key[q], 5, 7)
+      RFR_CAS(key[q], 0, 4) RFR_CAS(key[q], 1, 5) RFR_CAS(key[q], 2, 6) RFR_CAS(key[q], 3, 7)
+      RFR_CAS(key[q], 0, 1) RFR_CAS(key[q], 2, 3) RFR_CAS(key[q], 4, 5) RFR_CAS(key[q], 6, 7)
+      RFR_CAS(key[q], 2, 4) RFR_CAS(key[q], 3, 5)
+      RFR_CAS(key[q], 1, 4) RFR_CAS(key[q], 3, 6)
+      RFR_CAS(key[q], 1, 2) RFR_CAS(key[q], 3, 4) RFR_CAS(key[q], 5, 6)
+    }
+  }
+  stamp(p, 7);
+  uint32_t mine[kTokPerWarp] = {};
 #pragma unroll
-          for (int i = 0; i < 7; i++) key[i] = key[i + 1];
-          key[7] = 0u;
+  for (int kk = 0; kk < kMaxTopK; kk++) {
+    if (kk < topK) {
+#pragma unroll
+      for (int q = 0; q < kTokPerWarp; q++) {
+        if (q < nq) {
+          const uint32_t m = redux_max(key[q][0]);
+          if (key[q][0] == m) {
+#pragma unroll
+            for (int i = 0; i < 7; i++) key[q][i] = key[q][i + 1];
+            key[q][7] = 0u;
+          }
+          if (lane == kk) mine[q] = m;
         }
-        if (lane == kk) mine = m;
       }
     }
-    const bool sel = lane < topK;
-    const int e = 65535 - static_cast<int>(mine & 0xffffu);
-    const float s = __uint_as_float(twiddle_out(mine >> 16) << 16);
+  }
+  const bool sel = lane < topK;
+#pragma unroll
+  for (int q = 0; q < kTokPerWarp; q++) {
+    if (q >= nq) break;
+    const int t = warp + q * kWarps;
+    const uint32_t mk = sel ? mine[q] : 0u;
+    const int e = 65535 - static_cast<int>(mk & 0xffffu);
+    const float s = __uint_as_float(twiddle_out(mk >> 16) << 16);
     const float mx = __shfl_sync(0xffffffffu, s, 0);
     float pe = 0.f;
     if (sel) {
@@ -575,8 +631,9 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
     }
   }
   __syncthreads();
+  stamp(p, 4);
 
-  // 5. Per-expert counts, CTA counts, exclusive scan in expert order, CTA tables.
+  // 6. Per-expert counts, CTA counts, exclusive scan in expert order, CTA tables.
   const int tileLog2 = p.tileLog2;
   int cnt = 0, nCta = 0;
   if (tid < kE) {
@@ -612,19 +669,19 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
     }
   }
   __syncthreads();
+  stamp(p, 5);
 
-  // 6. Permutation: rows of an expert in token order.
-  for (int j = tid; j < p.M * topK; j += kThreads) {
-    const int t = j / topK;
-    const int e = sTopE[j];
+  // 7. Permutation: rows of an expert in token order.
+  for (int jj = tid; jj < p.M * topK; jj += kThreads) {
+    const int t = jj / topK;
+    const int e = sTopE[jj];
     const int pi = sOffP[e] + __popcll(sMask[e] & ((1ull << t) - 1ull));
-    p.expToPerm[j] = pi;
+    p.expToPerm[jj] = pi;
     p.permToTok[pi] = t;
   }
-  if (p.usePdl) {
-    __syncthreads();
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-  }
+  __syncthreads();
+  stamp(p, 6);
+  if (p.usePdl) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
 
 static int64_t max_ctas(int64_t m, int64_t k, int64_t e, int64_t tile) {
@@ -634,9 +691,32 @@ static int64_t max_ctas(int64_t m, int64_t k, int64_t e, int64_t tile) {
   return filled + (rem > 0 ? rem / tile : 0);
 }
 
+template <int TPC>
+static void launch(const Params& p, int device, cudaStream_t stream) {
+  static bool attrSet[64] = {};
+  if (!attrSet[device]) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(fused_router_routing_kernel<TPC>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        smem_bytes<TPC>()));
+    attrSet[device] = true;
+  }
+  const int tiles = (p.M + 7) / 8;
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(kE / 16, (tiles + TPC - 1) / TPC);
+  cfg.blockDim = dim3(kThreads);
+  cfg.dynamicSmemBytes = smem_bytes<TPC>();
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = p.usePdl ? 1 : 0;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, fused_router_routing_kernel<TPC>, p));
+}
+
 void run(torch::Tensor x, torch::Tensor w, torch::Tensor logits, torch::Tensor workspace, torch::Tensor totalPadded,
          torch::Tensor expToPerm, torch::Tensor permToTok, torch::Tensor weights, torch::Tensor tokPerExpert,
-         torch::Tensor ctaBatch, torch::Tensor ctaMn, torch::Tensor numCtas, int64_t topK, int64_t tileN, bool usePdl) {
+         torch::Tensor ctaBatch, torch::Tensor ctaMn, torch::Tensor numCtas, int64_t topK, int64_t tileN, bool usePdl,
+         int64_t tilesPerCta, torch::Tensor timing) {
   const int64_t M = x.size(0);
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16 &&
               logits.scalar_type() == at::kBFloat16 && weights.scalar_type() == at::kBFloat16);
@@ -667,6 +747,9 @@ void run(torch::Tensor x, torch::Tensor w, torch::Tensor logits, torch::Tensor w
   p.ctaBatch = ctaBatch.data_ptr<int32_t>();
   p.ctaMn = ctaMn.data_ptr<int32_t>();
   p.numCtas = numCtas.data_ptr<int32_t>();
+  const int64_t grid = 16 * ((M + 8 * tilesPerCta - 1) / (8 * tilesPerCta));
+  TORCH_CHECK(timing.numel() == 0 || (timing.scalar_type() == at::kLong && timing.numel() >= grid * 8));
+  p.timing = timing.numel() ? reinterpret_cast<unsigned long long*>(timing.data_ptr()) : nullptr;
   p.M = static_cast<int>(M);
   p.topK = static_cast<int>(topK);
   p.tileLog2 = 0;
@@ -674,24 +757,14 @@ void run(torch::Tensor x, torch::Tensor w, torch::Tensor logits, torch::Tensor w
   p.usePdl = usePdl;
 
   const c10::cuda::CUDAGuard guard(x.device());
-  static bool attrSet[64] = {};
   const int dev = x.device().index();
-  if (!attrSet[dev]) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(fused_router_routing_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-    attrSet[dev] = true;
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  switch (tilesPerCta) {
+    case 1: launch<1>(p, dev, stream); break;
+    case 2: launch<2>(p, dev, stream); break;
+    case 4: launch<4>(p, dev, stream); break;
+    default: TORCH_CHECK(false, "tiles_per_cta must be 1, 2 or 4");
   }
-  const int tiles = static_cast<int>((M + 7) / 8);
-  cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3(kE / 16, (tiles + kTilesPerCta - 1) / kTilesPerCta);
-  cfg.blockDim = dim3(kThreads);
-  cfg.dynamicSmemBytes = kSmemBytes;
-  cfg.stream = c10::cuda::getCurrentCUDAStream();
-  cudaLaunchAttribute attr[1];
-  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attr[0].val.programmaticStreamSerializationAllowed = 1;
-  cfg.attrs = attr;
-  cfg.numAttrs = usePdl ? 1 : 0;
-  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, fused_router_routing_kernel, p));
 }
 
 }  // namespace rfr

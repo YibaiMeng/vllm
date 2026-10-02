@@ -142,7 +142,7 @@ def _inputs(m: int, seed: int):
     return x.to(torch.bfloat16), w.to(torch.bfloat16)
 
 
-def _run(x, w, top_k, tile_n, method=4, use_pdl=False, out=None, logits=True):
+def _run(x, w, top_k, tile_n, method=4, use_pdl=False, out=None, logits=True, tpc=None):
     m = x.shape[0]
     if out is None:
         out = frr.FusedRoutingOutputs.allocate(frr.MAX_TOKENS, top_k, E, tile_n, "cuda")
@@ -157,6 +157,7 @@ def _run(x, w, top_k, tile_n, method=4, use_pdl=False, out=None, logits=True):
         renormalize_mode=method,
         use_pdl=use_pdl,
         logits_out=lg,
+        tiles_per_cta=tpc,
     )
     return view, lg
 
@@ -206,6 +207,21 @@ def test_tiles_methods_topk(tile_n: int, method: int, top_k: int):
     x, w = _inputs(20, seed=tile_n + method + top_k)
     view, logits = _run(x, w, top_k, tile_n, method=method)
     _check_against_reference(view, logits, top_k, tile_n)
+
+
+@pytest.mark.parametrize("m", [7, 9, 24, 33, 64])
+@pytest.mark.parametrize("tpc", [1, 2, 4])
+def test_launch_shapes_agree(m: int, tpc: int):
+    """Every tiles-per-CTA launch shape gives the same (reference) result."""
+    smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+    if smem < (64 + 32 * tpc) * 1024 + 1024:
+        pytest.skip(f"{tpc} token tiles per CTA need more shared memory")
+    x, w = _inputs(m, seed=77 + m)
+    view, logits = _run(x, w, 8, 8, tpc=tpc)
+    _assert_logits_close(logits, x, w)
+    _check_against_reference(view, logits, 8, 8)
+    _, ref_logits = _run(x, w, 8, 8, tpc=1)
+    assert torch.equal(logits, ref_logits)
 
 
 def test_ties_lower_expert_wins():
