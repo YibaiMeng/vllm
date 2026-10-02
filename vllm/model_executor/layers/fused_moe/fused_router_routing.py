@@ -266,6 +266,7 @@ def fused_router_routing(
     use_pdl: bool,
     logits_out: torch.Tensor | None = None,
     tiles_per_cta: int | None = None,
+    early_trigger: bool | None = None,
     timing_out: torch.Tensor | None = None,
 ) -> None:
     """Router logits ``bf16(x @ weight.T)`` + top-K softmax routing + metadata.
@@ -277,7 +278,9 @@ def fused_router_routing(
     RoutingMethodType value (Renormalize or RenormalizeNaive); ``logits_out``:
     optional bf16 [M, 256] contiguous that receives the router logits.
     ``tiles_per_cta`` (1, 2 or 4 eight-token tiles per CTA) overrides the default
-    launch shape; ``timing_out`` (int64, >= 8 per CTA) receives per-CTA
+    launch shape; ``early_trigger`` (PDL only) overrides when dependents are
+    triggered: when the routing CTA starts (True) or after its last write (False);
+    ``timing_out`` (int64, >= 8 per CTA) receives per-CTA
     %globaltimer phase stamps (profiling only).
     """
     num_tokens = x.shape[0]
@@ -324,11 +327,14 @@ def fused_router_routing(
         tile_n,
         use_pdl,
         tiles_per_cta or _default_tiles_per_cta(num_tokens),
+        EARLY_TRIGGER if early_trigger is None else early_trigger,
         _NO_TIMING if timing_out is None else timing_out,
     )
 
 
 _NO_TIMING = torch.empty(0, dtype=torch.int64)
+# Under PDL, trigger the dependents (FlashInfer's FC1) when the routing CTA starts.
+EARLY_TRIGGER = False
 
 
 def _default_tiles_per_cta(num_tokens: int) -> int:
@@ -397,6 +403,7 @@ struct Params {
   unsigned long long* timing;  // optional per-CTA phase timestamps (profiling), else nullptr
   int M, topK, tileLog2;
   bool usePdl;
+  bool earlyTrigger;  // PDL: trigger dependents when the routing CTA starts (else after its last write)
 };
 
 __device__ __forceinline__ float add_ftz(float a, float b) {
@@ -546,7 +553,10 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
   __syncthreads();
   stamp(p, 3);
   if (!sLast) return;
-  unsigned long long* sMask = reinterpret_cast<unsigned long long*>(smem);  // [256] token bitmask per expert
+  // Dependents (FC1) wait for this grid's completion before reading routing; triggering here only lets
+  // them launch and run their pre-wait prologue during the routing tail.
+  if (p.usePdl && p.earlyTrigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  uint32_t* sMask = reinterpret_cast<uint32_t*>(smem);  // [2][256] token bitmask per expert (tokens 0-31, 32-63)
   int* sTopE = reinterpret_cast<int*>(smem + 2048);                        // [M * topK] expert per slot
   int* sOffP = reinterpret_cast<int*>(smem + 4096);                        // [256] first row per expert
   int* sWarpTot = reinterpret_cast<int*>(smem + 5120);                     // [16]
@@ -569,7 +579,7 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
       key[q][i] = (twiddle_in(bits) << 16) | static_cast<uint32_t>(65535 - (lane * 8 + i));
     }
   }
-  if (tid < kE) sMask[tid] = 0ull;
+  sMask[tid] = 0u;  // kThreads == 2 * kE words
   __syncthreads();
 
   const int topK = p.topK;
@@ -586,6 +596,7 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
   }
   stamp(p, 7);
   uint32_t mine[kTokPerWarp] = {};
+  uint32_t top1[kTokPerWarp] = {};
 #pragma unroll
   for (int kk = 0; kk < kMaxTopK; kk++) {
     if (kk < topK) {
@@ -599,6 +610,7 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
             key[q][7] = 0u;
           }
           if (lane == kk) mine[q] = m;
+          if (kk == 0) top1[q] = m;
         }
       }
     }
@@ -611,7 +623,8 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
     const uint32_t mk = sel ? mine[q] : 0u;
     const int e = 65535 - static_cast<int>(mk & 0xffffu);
     const float s = __uint_as_float(twiddle_out(mk >> 16) << 16);
-    const float mx = __shfl_sync(0xffffffffu, s, 0);
+    // FlashInfer's max over the K scores = the top-1 score (a +-0 sign difference cannot change exp).
+    const float mx = __uint_as_float(twiddle_out(top1[q] >> 16) << 16);
     float pe = 0.f;
     if (sel) {
       float d, y;
@@ -619,15 +632,17 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
       asm("mul.ftz.f32 %0, %1, 0f3FB8AA3B;" : "=f"(y) : "f"(d));
       asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(pe) : "f"(y));
     }
+    // FlashInfer's butterfly (masks 16, 8, 4, 2, 1) over lanes holding 0 beyond K <= 8: the 16 and 8
+    // steps add exact zeros on lanes 0-7, so lanes 0-7 get the same sum from the 4, 2, 1 steps.
     float sum = pe;
 #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) sum = add_ftz(sum, __shfl_xor_sync(0xffffffffu, sum, mask));
+    for (int mask = 4; mask > 0; mask >>= 1) sum = add_ftz(sum, __shfl_xor_sync(0xffffffffu, sum, mask));
     if (sel) {
       float wq;
       asm("div.approx.ftz.f32 %0, %1, %2;" : "=f"(wq) : "f"(pe), "f"(sum));
       p.weights[t * topK + lane] = __float2bfloat16_rn(wq);
       sTopE[t * topK + lane] = e;
-      atomicOr(&sMask[e], 1ull << t);
+      atomicOr(&sMask[(t >> 5) * kE + e], 1u << (t & 31));
     }
   }
   __syncthreads();
@@ -637,7 +652,7 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
   const int tileLog2 = p.tileLog2;
   int cnt = 0, nCta = 0;
   if (tid < kE) {
-    cnt = __popcll(sMask[tid]);
+    cnt = __popc(sMask[tid]) + __popc(sMask[kE + tid]);
     nCta = (cnt + (1 << tileLog2) - 1) >> tileLog2;
   }
   int inc = nCta;
@@ -675,13 +690,15 @@ __global__ void __launch_bounds__(kThreads, 1) fused_router_routing_kernel(const
   for (int jj = tid; jj < p.M * topK; jj += kThreads) {
     const int t = jj / topK;
     const int e = sTopE[jj];
-    const int pi = sOffP[e] + __popcll(sMask[e] & ((1ull << t) - 1ull));
+    const uint32_t lo = sMask[e], hi = sMask[kE + e];
+    const int rank = t < 32 ? __popc(lo & ((1u << t) - 1u)) : __popc(lo) + __popc(hi & ((1u << (t - 32)) - 1u));
+    const int pi = sOffP[e] + rank;
     p.expToPerm[jj] = pi;
     p.permToTok[pi] = t;
   }
   __syncthreads();
   stamp(p, 6);
-  if (p.usePdl) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  if (p.usePdl && !p.earlyTrigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
 
 static int64_t max_ctas(int64_t m, int64_t k, int64_t e, int64_t tile) {
@@ -716,7 +733,7 @@ static void launch(const Params& p, int device, cudaStream_t stream) {
 void run(torch::Tensor x, torch::Tensor w, torch::Tensor logits, torch::Tensor workspace, torch::Tensor totalPadded,
          torch::Tensor expToPerm, torch::Tensor permToTok, torch::Tensor weights, torch::Tensor tokPerExpert,
          torch::Tensor ctaBatch, torch::Tensor ctaMn, torch::Tensor numCtas, int64_t topK, int64_t tileN, bool usePdl,
-         int64_t tilesPerCta, torch::Tensor timing) {
+         int64_t tilesPerCta, bool earlyTrigger, torch::Tensor timing) {
   const int64_t M = x.size(0);
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16 &&
               logits.scalar_type() == at::kBFloat16 && weights.scalar_type() == at::kBFloat16);
@@ -755,6 +772,7 @@ void run(torch::Tensor x, torch::Tensor w, torch::Tensor logits, torch::Tensor w
   p.tileLog2 = 0;
   while ((int64_t{1} << p.tileLog2) < tileN) p.tileLog2++;
   p.usePdl = usePdl;
+  p.earlyTrigger = earlyTrigger;
 
   const c10::cuda::CUDAGuard guard(x.device());
   const int dev = x.device().index();
