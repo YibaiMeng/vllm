@@ -435,6 +435,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+            MambaHybridModelState,
+        )
+
+        if isinstance(self.model_state, MambaHybridModelState):
+            # GDN deferred commit: the persistent num_computed_tokens buffer,
+            # bound before any CUDA graph capture bakes its address.
+            self.model_state.bind_req_states(self.req_states)
 
         self.decode_query_len = (
             self.num_speculative_steps
