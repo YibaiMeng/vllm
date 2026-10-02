@@ -23,6 +23,11 @@ producer before touching global memory and triggers its dependents after its
 last write, which makes it PDL-safe (unlike the cluster / cooperative launches
 FlashInfer PR #4806 disabled MoE PDL for on SM107).
 
+The patch also lets FlashInfer's MXFP8 prepared-metadata ("DA") bodies run
+with ``do_finalize=False`` (stop after FC2, for the deferred finalize), which
+the fused router + routing path uses (``experts/trtllm_fused_routing.py``);
+other calls are unaffected.
+
 When enabled, the patch is applied to the installed FlashInfer sources and
 FlashInfer's trtllm fused-MoE JIT module is built from them under a renamed
 module name (``<stock name>_<GS2_ROUTE_TAG>``), so neither the stock JIT build
@@ -82,6 +87,13 @@ def _env_int(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
 
 
+def installed() -> bool:
+    """Whether :func:`maybe_install` replaced FlashInfer's trtllm fused-MoE
+    module by the patched one.
+    """
+    return _installed
+
+
 def single_cta_routing_covers(num_tokens: int, num_experts: int, top_k: int) -> bool:
     """Whether the loaded patched module runs this logits-routed
     (routingCustom, e.g. Renormalize) MoE call's permutation as the single-CTA
@@ -118,6 +130,9 @@ _BASE_SOURCE_SHA256 = {
     ),
     "trtllm_fused_moe_routing_custom.cu": (
         "a04638539d3deb9d7e224ab8f7673a6a87eadfedf59204e6b21c39885f77cd6a"
+    ),
+    "trtllm_fused_moe_kernel_launcher.cu": (
+        "7b7adacc9117eb64869bb68b96818af9588a85651afd83cb4a27abaae54152bf"
     ),
 }
 
@@ -313,8 +328,9 @@ def _prebuilt_spec_cls(base: type) -> type:
 
 
 # Unified diff against FlashInfer 0.6.18.post1
-# csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_{common,custom}.cu
-# (installed as flashinfer/data/csrc/fused_moe/trtllm_backend/...).
+# csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_{common,custom}.cu and
+# csrc/trtllm_fused_moe_kernel_launcher.cu (MXFP8 DA bodies with do_finalize=False)
+# (installed as flashinfer/data/csrc/...).
 FLASHINFER_PATCH = r"""--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu
 +++ b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu
 @@ -14,6 +14,8 @@
@@ -690,4 +706,25 @@ FLASHINFER_PATCH = r"""--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_rout
      bool const canUseCoop =
          (smMajor >= 9) && (data.mNumExperts <= 1024) && (data.mPtrPermutedIdxSize != nullptr);
      bool useCoop = false;
+--- a/csrc/trtllm_fused_moe_kernel_launcher.cu
++++ b/csrc/trtllm_fused_moe_kernel_launcher.cu
+@@ -2498,7 +2498,8 @@
+                                            int64_t moe_tactic) {
+     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+     TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8);
+-    TVM_FFI_ICHECK(args->do_finalize) << "MXFP8 DA bodies require finalized output.";
++    // vLLM GS2 patch: do_finalize=false stops after FC2; the caller reduces the prepared
++    // gemm2_output (FFI[2]) with the routing record's expert weights and permutation map.
+     bind_routing_metadata(routing_metadata);
+     args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                              : btg::Dtype::Bfloat16;
+@@ -2542,7 +2543,7 @@
+     // Resolve the MXFP8 routing-weight ABI before binding the lane-owned maximum workspace.
+     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+     TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::MxFp8);
+-    TVM_FFI_ICHECK(args->do_finalize) << "MXFP8 DA bodies require finalized output.";
++    // vLLM GS2 patch: do_finalize=false stops after FC2 (see prepare_mxfp8_da_body).
+     bind_routing_metadata(routing_metadata);
+     args->mDtypeExpW = routing_metadata.expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32
+                                                                              : btg::Dtype::Bfloat16;
 """

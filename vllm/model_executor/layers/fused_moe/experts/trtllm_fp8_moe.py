@@ -15,6 +15,12 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.experts.trtllm_fused_routing import (
+    FusedRouterInput,
+    fused_router_routing_supported,
+    prepare_fused_router_routing,
+    run_fused_router_routing,
+)
 from vllm.model_executor.layers.fused_moe.flashinfer_exact_routing import (
     single_cta_routing_covers,
 )
@@ -460,6 +466,34 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         # The MXFP8 path stops after GEMM2 when the config allows it.
         return self.quant_config.block_shape == [1, 32]
 
+    def supports_fused_router_routing(self, gate: torch.nn.Module) -> bool:
+        return (
+            self.quant_config.block_shape == [1, 32]
+            and self.moe_config.activation == MoEActivation.SILU
+            and fused_router_routing_supported(
+                gate=gate,
+                routing_method=self.routing_method_type,
+                num_experts=self.moe_config.num_experts,
+                num_local_experts=self.local_num_experts,
+                top_k=self.topk,
+                hidden_size=self.hidden_dim,
+                has_swiglu_params=self.gemm1_alpha is not None
+                or self.gemm1_beta is not None
+                or self.gemm1_clamp_limit is not None,
+            )
+        )
+
+    def prepare_fused_router_routing(self, w1: torch.Tensor, w2: torch.Tensor) -> None:
+        """Create the fused router + routing buffers before CUDA-graph capture
+        (call only when ``supports_fused_router_routing`` holds).
+        """
+        prepare_fused_router_routing(
+            self,
+            w1,
+            w2,
+            activation_type=activation_to_flashinfer_int(self.moe_config.activation),
+        )
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -598,11 +632,48 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             n_group = num_expert_group or 0
             selected_topk_group = topk_group or 0
 
+        num_tokens = hidden_states.shape[0]
+        # FlashInfer's 0-token call keeps the finalized (empty) form.
+        defer = is_mxfp8 and self.moe_config.should_defer_moe_finalize(num_tokens)
+        if isinstance(router_logits, FusedRouterInput):
+            result = None
+            if (
+                is_mxfp8
+                and e_score_correction_bias is None
+                and routed_scaling_factor in (None, 1.0)
+                and n_group is None
+                and selected_topk_group is None
+            ):
+                result = run_fused_router_routing(
+                    self,
+                    router_logits,
+                    hidden_states,
+                    hidden_states_scale,
+                    w1,
+                    w2,
+                    activation_type=activation_type,
+                    deferred=defer,
+                    # The fused kernel and the bmm FC1/FC2 wait on their
+                    # producer before reading it, as the gated stock chain.
+                    use_pdl=current_platform.is_device_capability(107)
+                    and _sm107_moe_pdl_allowed(
+                        num_tokens,
+                        global_num_experts,
+                        hidden_states.shape[-1],
+                        self.routing_method_type,
+                        n_group,
+                        self.topk,
+                        deferred=defer,
+                    ),
+                )
+            if result is not None:
+                return result
+            router_logits = router_logits.logits()
+
         routing_replay_out = self._maybe_make_routing_replay_buffer(
-            num_tokens=hidden_states.shape[0],
+            num_tokens=num_tokens,
             device=hidden_states.device,
         )
-
         kwargs = dict(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
@@ -632,9 +703,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         )
         if is_mxfp8 or activation == MoEActivation.RELU2_NO_MUL:
             kwargs["activation_type"] = activation_type
-        num_tokens = hidden_states.shape[0]
-        # FlashInfer's 0-token call keeps the finalized (empty) form.
-        defer = is_mxfp8 and self.moe_config.should_defer_moe_finalize(num_tokens)
         if defer:
             kwargs["do_finalize"] = False
         with _sm107_moe_pdl(

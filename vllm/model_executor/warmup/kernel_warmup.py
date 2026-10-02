@@ -261,6 +261,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     elif has_flashinfer() and current_platform.has_device_capability(90):
         flashinfer_autotune(worker.model_runner)
 
+    # Fused MoE router + routing: graph-stable buffers and DA bodies for the
+    # tactics just tuned (decode CUDA graphs are captured without eager
+    # warmup runs, and nothing may be allocated during capture).
+    if envs.VLLM_MOE_FUSED_ROUTING_MAX_TOKENS > 0:
+        _prepare_fused_moe_router_routing(worker)
+
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
     # and is not a pooling model
@@ -292,6 +298,22 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             force_attention=True,
             create_mixed_batch=True,
         )
+
+
+def _prepare_fused_moe_router_routing(worker: "Worker") -> None:
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    models = [worker.get_model()]
+    drafter_model = getattr(
+        getattr(worker.model_runner, "drafter", None), "model", None
+    )
+    if isinstance(drafter_model, torch.nn.Module):
+        models.append(drafter_model)
+    with torch.inference_mode():
+        for model in models:
+            for module in model.modules():
+                if isinstance(module, MoERunner):
+                    module.prepare_fused_router_routing()
 
 
 def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
