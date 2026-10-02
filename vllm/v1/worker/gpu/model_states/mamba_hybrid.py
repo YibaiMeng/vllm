@@ -10,6 +10,10 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.mamba.gdn.gdn_deferred_commit import (
+    GdnDeferredCommit,
+    GdnDeferredStep,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import (
@@ -31,6 +35,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
+from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.mamba_utils import (
     MambaSpecDecodeGPUContext,
     get_mamba_group_ids,
@@ -57,6 +62,9 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     # share the step: its first build writes every builder's decode metadata,
     # and num_accepted_tokens is gathered only if a build needs it.
     gdn_decode: GDNFusedDecodeStep | None = None
+    # Set when the GDN deferred commit is on (real steps): the step's batch
+    # rows -> request state rows, for the GDN builders.
+    gdn_deferred_step: GdnDeferredStep | None = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -77,21 +85,31 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             if self.num_decode_draft_tokens_cpu is None
             else self.num_decode_draft_tokens_cpu[:num_reqs]
         )
+        extra: dict[str, Any] = {}
+        if self.gdn_deferred_step is not None and isinstance(
+            attn_metadata_builder, GDNAttentionMetadataBuilder
+        ):
+            extra["deferred_step"] = self.gdn_deferred_step
         if self.gdn_decode is not None and self.gdn_decode.fuses(attn_metadata_builder):
             return {
                 "num_decode_draft_tokens_cpu": num_decode_draft_tokens_cpu,
                 "fused_decode": self.gdn_decode,
+                **extra,
             }
         return {
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
             else self.num_accepted_tokens[:num_reqs],
             "num_decode_draft_tokens_cpu": num_decode_draft_tokens_cpu,
+            **extra,
         }
 
 
 class MambaHybridModelState(DefaultModelState):
     """Model state for hybrid attention + Mamba / linear-attention models."""
+
+    # GDN spec-decode deferred commit (set by __init__ when enabled).
+    gdn_deferred_commit: GdnDeferredCommit | None = None
 
     def __init__(
         self,
@@ -118,6 +136,16 @@ class MambaHybridModelState(DefaultModelState):
         self._gdn_decode_fusions: dict[
             tuple[int, ...], GDNDecodeMetadataFusion | None
         ] = {}
+        # GDN spec-decode deferred single-state commit (opt-in); None when off.
+        self.gdn_deferred_commit = GdnDeferredCommit.maybe_create(
+            vllm_config,
+            self.max_num_reqs,
+            self.num_accepted_tokens_gpu,
+            self.device,
+        )
+        # req_id -> request state row, to invalidate its deferred-commit
+        # headers on removal.
+        self._gdn_dc_req_index: dict[str, int] = {}
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -137,10 +165,28 @@ class MambaHybridModelState(DefaultModelState):
         super().add_request(req_index, new_req_data)
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
+        if self.gdn_deferred_commit is not None:
+            self._gdn_dc_req_index[new_req_data.req_id] = req_index
+            self.gdn_deferred_commit.invalidate(req_index)
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
             self._mamba_state_idx_gpu[req_index].fill_(
                 (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+            )
+
+    def remove_request(self, req_id: str) -> None:
+        super().remove_request(req_id)
+        if self.gdn_deferred_commit is not None:
+            req_index = self._gdn_dc_req_index.pop(req_id, None)
+            if req_index is not None:
+                self.gdn_deferred_commit.invalidate(req_index)
+
+    def bind_req_states(self, req_states: RequestState) -> None:
+        """Called by the model runner before any capture or step."""
+        if self.gdn_deferred_commit is not None:
+            # Persistent (its address never changes): FULL graphs bake it in.
+            self.gdn_deferred_commit.bind_num_computed(
+                req_states.num_computed_tokens.gpu
             )
 
     def _get_mamba_group_info(
@@ -288,6 +334,27 @@ class MambaHybridModelState(DefaultModelState):
         num_decode_draft_tokens_cpu = None
         gdn_decode = None
         has_spec_tokens = self.vllm_config.num_speculative_tokens > 0
+        gdn_deferred_step = None
+        dc = self.gdn_deferred_commit
+        if dc is not None:
+            # Before any build (whose materialize reads the headers) and before
+            # the decode-metadata fusion bakes in the builders' buffers.
+            dc.flush_invalidations()
+            gdn_builders = [
+                builder
+                for groups in attn_groups
+                for group in groups
+                if isinstance(
+                    builder := group.get_metadata_builder(0),
+                    GDNAttentionMetadataBuilder,
+                )
+            ]
+            if gdn_builders:
+                dc.bind_builders(gdn_builders)
+            if not for_capture:
+                gdn_deferred_step = dc.begin_step(
+                    input_batch.idx_mapping, input_batch.idx_mapping_np
+                )
         if not for_capture:
             gdn_decode_fusion = self._get_gdn_decode_fusion(attn_groups)
             if gdn_decode_fusion is not None:
@@ -345,6 +412,7 @@ class MambaHybridModelState(DefaultModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
             gdn_decode=gdn_decode,
+            gdn_deferred_step=gdn_deferred_step,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

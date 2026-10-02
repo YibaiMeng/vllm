@@ -868,6 +868,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "requests",
                 GDN_FUSED_DECODE_MAX_REQUESTS,
             )
+        # GDN deferred commit (gdn_deferred_commit.GdnDeferredCommit sets
+        # both): this layer's [max_num_reqs, HV, 16] header view and the
+        # manager (num_computed, block size).
+        self._gdn_dc_hdr: torch.Tensor | None = None
+        self._gdn_dc = None
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -1942,6 +1947,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if attn_metadata.spec_deferred and not spec_done:
+            # Only the fused-norm CUDA MTP path has a deferred mode; any other
+            # reader of the spec rows would read uncommitted state.
+            raise RuntimeError(
+                f"GDN deferred commit: {self.prefix} cannot run the deferred "
+                "spec-decode kernel for this batch"
+            )
 
         if (
             self.enable_packed_recurrent_decode
@@ -2552,7 +2564,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata: GDNAttentionMetadata,
     ) -> bool:
         """Spec-decode recurrence; returns whether the gated norm was applied
-        (CUDA MTP kernel) or is left to the caller (Triton recurrence).
+        (CUDA MTP kernel) or is left to the caller (Triton recurrence). Deferred
+        steps (``attn_metadata.spec_deferred``) always run the CUDA kernel's
+        deferred mode, or raise.
         """
         state_indices = attn_metadata.spec_state_indices_tensor
         cu_seqlens = attn_metadata.spec_query_start_loc
@@ -2562,7 +2576,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert num_accepted_tokens is not None
 
         num_requests = attn_metadata.num_spec_decodes
-        if num_requests <= GDN_MTP_TRITON_MAX_REQUESTS:
+        if num_requests <= GDN_MTP_TRITON_MAX_REQUESTS and not (
+            attn_metadata.spec_deferred
+        ):
             gdn_mtp_recurrence(
                 mixed_qkv,
                 a,
@@ -2594,6 +2610,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.layer_norm_epsilon,
             self.norm.activation,
         )
+        if attn_metadata.spec_deferred:
+            dc = self._gdn_dc
+            req_rows = attn_metadata.spec_req_rows
+            assert dc is not None and dc.num_computed is not None
+            assert req_rows is not None
+            if not gdn_mtp_cuda.gdn_mtp_cuda_deferred(
+                *args,
+                req_rows=req_rows[:num_requests],
+                hdr=self._gdn_dc_hdr,
+                num_computed=dc.num_computed,
+                block_size=dc.block_size,
+            ):
+                raise RuntimeError(
+                    f"GDN deferred commit: {self.prefix} inputs do not meet the "
+                    "deferred CUDA MTP kernel's layout contract"
+                )
+            return True
         if gdn_mtp_cuda.ready() and gdn_mtp_cuda.gdn_mtp_cuda(*args):
             return True
         ops.fused_gdn_decode_post_conv_mtp(*args)
@@ -2853,6 +2886,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ):
             if (
                 quantize
+                and not attn_metadata.spec_deferred
                 and self._fused_decode_counters is not None
                 and attn_metadata.num_spec_decodes <= GDN_FUSED_DECODE_MAX_REQUESTS
                 and attn_metadata.spec_state_indices_tensor is not None

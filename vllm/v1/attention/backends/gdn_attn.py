@@ -4,8 +4,9 @@
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -29,6 +30,12 @@ from vllm.v1.kv_cache_interface import (
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.mamba.gdn.gdn_deferred_commit import (
+        GdnDeferredCommitGroup,
+        GdnDeferredStep,
+    )
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -173,6 +180,11 @@ class GDNAttentionMetadata:
     non_spec_token_start: int | None = None
     # Set on steps where a prefill sequence exports an internal checkpoint.
     prefill_checkpoint: GDNPrefillCheckpointMetadata | None = None
+    # Deferred-commit spec step (gdn_deferred_commit): the spec rows run the
+    # CUDA MTP kernel's deferred mode. spec_req_rows: int32 request state row
+    # per spec row (-1: padded row, or snapshot mode at capture).
+    spec_deferred: bool = False
+    spec_req_rows: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -331,6 +343,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.checkpoint_drop_eagle_block: bool = (
             self.speculative_config is not None
             and self.speculative_config.use_eagle_block_drop()
+        )
+        # GDN deferred commit (bind_deferred_commit): this builder's group and
+        # the persistent FULL-graph spec_req_rows buffer; None when off.
+        self.deferred_commit: GdnDeferredCommitGroup | None = None
+        self.spec_req_rows: torch.Tensor | None = None
+
+    def bind_deferred_commit(self, group: "GdnDeferredCommitGroup") -> None:
+        self.deferred_commit = group
+        self.spec_req_rows = torch.full(
+            (self.decode_cudagraph_max_bs,),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
         )
 
     def _plan_prefill_checkpoint(
@@ -673,6 +698,86 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             m.query_start_loc_cpu[-1].item(),
         )
 
+    def _spec_deferred(
+        self,
+        split: "GDNBatchSplit",
+        m: CommonAttentionMetadata,
+        spec_token_start: int | None,
+    ) -> bool:
+        """Whether this batch's spec rows run deferred (gdn_deferred_commit):
+        no non-spec decodes, spec rows present, prefills (if any) in a block
+        apart from the contiguous spec block, and at least min_reqs requests,
+        counting the padded batch for the FULL-graph decode buffers so capture
+        and replay agree.
+        """
+        dc = self.deferred_commit
+        if (
+            dc is None
+            or split.num_decodes > 0
+            or split.num_spec_decodes == 0
+            or (split.num_prefills > 0 and spec_token_start is None)
+        ):
+            return False
+        n_eff = (
+            m.num_reqs
+            if self._uses_spec_decode_buffers(split)
+            else split.num_spec_decodes
+        )
+        return n_eff >= dc.min_reqs and dc.manager.kernel_ready()
+
+    def _apply_deferred_commit(
+        self,
+        metadata: GDNAttentionMetadata,
+        split: "GDNBatchSplit",
+        m: CommonAttentionMetadata,
+        deferred_step: "GdnDeferredStep | None",
+        for_capture: bool,
+        rows_written: bool = False,
+    ) -> None:
+        """Set the deferred-commit fields of ``metadata`` and keep the group's
+        pending set: a deferred step materializes the pending request states
+        among its non-spec rows and marks its spec request states; the first
+        other step materializes all of them (eager, before the forward).
+        Capture builds keep the persistent rows at -1 (snapshot mode) and touch
+        no state. ``rows_written``: GDNFusedDecodeStep already wrote the rows.
+        """
+        dc = self.deferred_commit
+        if dc is None:
+            return
+        if not self._spec_deferred(split, m, metadata.spec_token_start):
+            if not for_capture:
+                dc.note_step(False)
+                dc.materialize_pending()
+            return
+        metadata.spec_deferred = True
+        mask = split.spec_sequence_masks_cpu
+        assert mask is not None
+        if self._uses_spec_decode_buffers(split):
+            assert self.spec_req_rows is not None
+            rows_buf = self.spec_req_rows[: m.num_reqs]
+            if for_capture:
+                rows_buf.fill_(-1)
+            elif not rows_written:
+                assert deferred_step is not None
+                rows = np.full(m.num_reqs, -1, dtype=np.int32)
+                rows[: split.num_spec_decodes] = deferred_step.spec_req_rows_np(mask)
+                async_tensor_h2d(rows, out=rows_buf)
+            metadata.spec_req_rows = rows_buf
+        else:
+            assert not for_capture and deferred_step is not None
+            metadata.spec_req_rows = deferred_step.spec_req_rows(mask, self.device)
+        if not for_capture:
+            assert deferred_step is not None
+            dc.note_step(True)
+            if split.num_prefills > 0:
+                # Pending request states among the non-spec rows (e.g. a
+                # reclassified 1-token row) are read by the prefill path, which
+                # needs their committed state at slots[num_accepted - 1].
+                idx_np = deferred_step.idx_mapping_np
+                non_spec = ~mask.numpy()[: idx_np.shape[0]]
+                dc.materialize_rows(idx_np[np.flatnonzero(non_spec)])
+            dc.mark_pending(deferred_step.spec_req_rows_np(mask))
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -681,6 +786,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
         fused_decode: "GDNFusedDecodeStep | None" = None,
+        deferred_step: "GdnDeferredStep | None" = None,
+        for_cudagraph_capture: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
@@ -689,7 +796,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             split = fused_decode.split_batch(self, m, num_decode_draft_tokens_cpu)
             if fused_decode.write_decode_buffers(self, split, m):
-                return self._decode_buffers_metadata(split, m)
+                metadata = self._decode_buffers_metadata(split, m)
+                self._apply_deferred_commit(
+                    metadata,
+                    split,
+                    m,
+                    deferred_step,
+                    for_capture=False,
+                    rows_written=True,
+                )
+                return metadata
             num_accepted_tokens = fused_decode.num_accepted_tokens()
 
         shared = None if fused_decode is None else fused_decode.shared_build
@@ -880,6 +996,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_start=shared.spec_token_start,
             non_spec_token_start=shared.non_spec_token_start,
             prefill_checkpoint=prefill_checkpoint,
+        )
+        self._apply_deferred_commit(
+            attn_metadata, split, m, deferred_step, for_cudagraph_capture
         )
         return attn_metadata
 
@@ -1163,7 +1282,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
         assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
 
-        return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+        return self.build(
+            0,
+            m,
+            num_accepted_tokens,
+            num_decode_draft_tokens_cpu,
+            for_cudagraph_capture=True,
+        )
 
 
 class GDNDecodeMetadataFusion:
@@ -1193,8 +1318,12 @@ class GDNDecodeMetadataFusion:
         self.num_state_cols = first.num_spec + 1
         self.align = first.vllm_config.cache_config.mamba_cache_mode == "align"
         self.mamba_block_size = first.kv_cache_spec.block_size
-        # [num_builders, 7] addresses of the persistent buffers, in the order
-        # _gdn_decode_metadata_kernel reads them.
+        # Deferred commit binds every GDN builder or none of them.
+        req_rows = [builder.spec_req_rows for builder in self._builders]
+        self.writes_req_rows = req_rows[0] is not None
+        assert all((t is not None) == self.writes_req_rows for t in req_rows)
+        # [num_builders, 8] addresses of the persistent buffers, in the order
+        # _gdn_decode_metadata_kernel reads them (spec_req_rows: 0 when off).
         self.out_ptrs = torch.tensor(
             [
                 [
@@ -1208,6 +1337,11 @@ class GDNDecodeMetadataFusion:
                         builder.non_spec_state_indices_tensor,
                         builder.non_spec_query_start_loc,
                     )
+                ]
+                + [
+                    0
+                    if builder.spec_req_rows is None
+                    else builder.spec_req_rows.data_ptr()
                 ]
                 for _, builder in builders
             ],
@@ -1415,6 +1549,10 @@ class GDNFusedDecodeStep:
             ):
                 return False
             num_spec_tokens = builder._spec_token_size(split, m)
+            # Deferred step: also write the spec rows' request state rows.
+            write_req_rows = fusion.writes_req_rows and builder._spec_deferred(
+                split, m, None
+            )
         else:
             if not builder._uses_decode_buffers(split):
                 return False
@@ -1423,6 +1561,7 @@ class GDNFusedDecodeStep:
                 return False
             num_spec_decodes = 0
             num_spec_tokens = 0
+            write_req_rows = False
         layout = fusion.block_table_layout(self._block_tables)
         if layout is None:
             return False
@@ -1439,6 +1578,7 @@ class GDNFusedDecodeStep:
             num_spec_decodes,
             num_spec_tokens,
             SPEC=spec_sequence_masks_cpu is not None,
+            REQ_ROWS=write_req_rows,
             NUM_STATE_COLS=fusion.num_state_cols,
             ALIGN=fusion.align,
             MAMBA_BLOCK_SIZE=fusion.mamba_block_size,
@@ -1551,7 +1691,7 @@ def _state_block_start(
 
 @triton.jit(do_not_specialize=["batch_size", "num_spec_decodes", "num_spec_tokens"])
 def _gdn_decode_metadata_kernel(
-    out_ptrs,  # [num_builders, 7] persistent buffer addresses
+    out_ptrs,  # [num_builders, 8] persistent buffer addresses
     block_table_ptrs,  # [num_builders]
     block_table_strides,  # [num_builders]
     seq_lens_ptr,  # [batch_size]
@@ -1562,6 +1702,7 @@ def _gdn_decode_metadata_kernel(
     num_spec_decodes,
     num_spec_tokens,
     SPEC: tl.constexpr,
+    REQ_ROWS: tl.constexpr,
     NUM_STATE_COLS: tl.constexpr,
     ALIGN: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
@@ -1573,7 +1714,7 @@ def _gdn_decode_metadata_kernel(
     # num_spec_decodes rows are spec decodes (SPEC) or whose rows are all
     # decodes (not SPEC).
     builder = tl.program_id(0)
-    outs = out_ptrs + builder * 7
+    outs = out_ptrs + builder * 8
     block_table = _load_out_ptr(block_table_ptrs, builder, tl.int32)
     block_table_stride = tl.load(block_table_strides + builder)
     offs = tl.arange(0, BLOCK_SIZE)
@@ -1597,7 +1738,8 @@ def _gdn_decode_metadata_kernel(
             )
             tl.store(state_indices + idx, block_ids, mask=idx < num_states)
 
-        # spec_sequence_masks[:batch_size] and num_accepted_tokens[:batch_size].
+        # spec_sequence_masks[:batch_size] and num_accepted_tokens[:batch_size]
+        # (REQ_ROWS: and spec_req_rows[:batch_size], -1 for the padded rows).
         masks = _load_out_ptr(outs, 1, tl.int8)
         num_accepted = _load_out_ptr(outs, 4, tl.int32)
         for i in range(0, batch_size, BLOCK_SIZE):
@@ -1610,6 +1752,13 @@ def _gdn_decode_metadata_kernel(
                 num_accepted_tokens_by_req_ptr + req_idx, mask=is_spec, other=1
             )
             tl.store(num_accepted + row, accepted, mask=valid)
+            if REQ_ROWS:
+                req_rows = _load_out_ptr(outs, 7, tl.int32)
+                tl.store(
+                    req_rows + row,
+                    tl.where(is_spec, req_idx, -1).to(tl.int32),
+                    mask=valid,
+                )
 
         # spec_token_indx[:num_spec_tokens] = arange(num_spec_tokens).
         token_indx = _load_out_ptr(outs, 2, tl.int32)
