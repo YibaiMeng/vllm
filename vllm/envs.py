@@ -216,6 +216,8 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
+    VLLM_DSV41_GRAPH_BOUNDED_REPLAY: bool = False
+    VLLM_DSV41_ENGRAM_ALL_TO_ALL: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
@@ -300,9 +302,12 @@ if TYPE_CHECKING:
     VLLM_USE_NCCL_SYMM_MEM: bool = False
     VLLM_NCCL_INCLUDE_PATH: str | None = None
     VLLM_GC_DEBUG: str = ""
+    VLLM_ENGINE_DEFER_FULL_GC: bool = False
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
+    VLLM_DSV41_MEGAMOE_SM107: bool = False
+    VLLM_DSV41_MEGAMOE_PERDIE: str = "0"
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -1648,6 +1653,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ids to -1 so the dispatch and experts drop them. Requires a MoE kernel that
     # treats topk_id == -1 as a skip sentinel
     "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "1"))),
+    # DeepSeek-V4.1 decoder SWA bounded replay in piecewise CUDA-graph steps:
+    # the decoder layers replay a separately captured graph on each prefill's
+    # last window rows instead of running on the whole batch.
+    "VLLM_DSV41_GRAPH_BOUNDED_REPLAY": lambda: bool(
+        int(os.getenv("VLLM_DSV41_GRAPH_BOUNDED_REPLAY", "0"))
+    ),
+    # DeepSeek-V4.1 Engram tables sharded across DP replicas: return each
+    # replica's looked-up rows with an all-to-all instead of an all-gather.
+    "VLLM_DSV41_ENGRAM_ALL_TO_ALL": lambda: bool(
+        int(os.getenv("VLLM_DSV41_ENGRAM_ALL_TO_ALL", "0"))
+    ),
     # Kimi-K3 only. Under sequence-parallel MoE the dense and shared-expert MLPs
     # are replicated on every rank, so each rank streams the whole weight to
     # serve its own token shard. Shard them across TP instead: the MLP then
@@ -2075,6 +2091,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - VLLM_GC_DEBUG='{"top_objects":5}': enable GC debugger with
     #                                      top 5 collected objects
     "VLLM_GC_DEBUG": lambda: os.getenv("VLLM_GC_DEBUG", ""),
+    # If set, the engine core stops automatic collections of the oldest GC
+    # generation and runs them when it idles instead. A full collection
+    # traverses every in-flight request's token lists; at high concurrency
+    # with long prompts it pauses the scheduler for ~0.5 s, which under data
+    # parallelism stalls every rank.
+    "VLLM_ENGINE_DEFER_FULL_GC": lambda: bool(
+        int(os.getenv("VLLM_ENGINE_DEFER_FULL_GC", "0"))
+    ),
     # Debug workspace allocations.
     # logging of workspace resize operations.
     "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
@@ -2088,6 +2112,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION": lambda: bool(
         int(os.getenv("VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION", "0"))
     ),
+    # Opt-in Rubin (sm_107) DeepGEMM MegaMoE kernel: K=64 block-scaled UMMA with packed FP4 weights in shared
+    # memory (same math as the SM100 kernel up to FP32 accumulation order). Requires the patched DeepGEMM
+    # (kernels/megamoe overlay); sets DG_MEGA_MOE_SM107=1 for DeepGEMM. Ignored on other GPUs.
+    "VLLM_DSV41_MEGAMOE_SM107": lambda: bool(
+        int(os.getenv("VLLM_DSV41_MEGAMOE_SM107", "0"))
+    ),
+    # Opt-in per-die (Rubin locality domain) execution of the SM107 MegaMoE kernel (needs VLLM_DSV41_MEGAMOE_SM107=1
+    # and the per-die DeepGEMM overlay): "0" off, "1" per-die task queues + die-local routed and shared expert
+    # weights, "routed" per-die queues + die-local routed weights only (no extra memory for the shared experts).
+    # Incompatible with EPLB (the localized weights are not (E, ...) tensors).
+    "VLLM_DSV41_MEGAMOE_PERDIE": lambda: os.getenv("VLLM_DSV41_MEGAMOE_PERDIE", "0"),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
     # execution is not beneficial (most likely because of the input clone)
